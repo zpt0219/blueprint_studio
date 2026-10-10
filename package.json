@@ -1,0 +1,28 @@
+{
+  "name": "blueprint-studio",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Adna Blueprint Studio — Integrated Web Reroll & Asset Tagger Workbench",
+  "scripts": {
+    "generate": "node scripts/gen-role-colors.mjs",
+    "predev": "npm run generate",
+    "dev": "vite",
+    "prebuild": "npm run generate",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.3",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "~5.6.3",
+    "vite": "^6.0.7"
+  }
+}
