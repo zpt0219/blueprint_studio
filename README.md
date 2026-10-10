@@ -50,6 +50,7 @@ blueprint_studio/
 │   ├── gen-role-colors.mjs       # Code generator for roleColors.ts
 │   └── publish-pages.sh          # One-click GitHub Pages deployment
 ├── docs/                         # Specification & architecture docs
+│   ├── TILEMAP_EDITOR_EVOLUTION_PLAN.md  # 演进总方案 (Master Plan)
 │   ├── WEB_LITE_REROLL_EDITOR.md
 │   ├── WEB_LITE_SCHEMA.md
 │   └── WEB_ASSET_TAGGER_PLAN.md

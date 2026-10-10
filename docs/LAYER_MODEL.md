@@ -1,7 +1,9 @@
 # Reroll layer model — category layers
 
-Status: **spec, agreed** — not yet implemented. This is the target model for how
-reroll groups a converted blueprint into editable layers.
+Status: **SUPERSEDED** (2026-10-10) — The 6-category model described here was not adopted.
+The actual implementation normalizes layers to the 7 top-level categories from the authoritative
+role taxonomy tree (`palette_tag_tree` in `src/reroll/roleTreeData.ts` via `src/reroll/normalize.ts`).
+See `tilemap_editor_evolution_plan.md` for details.
 
 ## Why
 

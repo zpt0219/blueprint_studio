@@ -10,7 +10,15 @@
 - `src/serialize/blueprint_importer.cpp` / `src/command/commands_blueprint.cpp`（引擎侧 import+compile：blueprint→Layer 子树→绑 palette）
 - `desktop/src/blueprint_palette.h`（引擎侧 role→color，与 overlay 调色板逐位一致）
 
-> **v2.3（本次）**：清空 §16 开放问题，定了 7 条 —— ① web **永不新建地图**，canvas 尺寸 = blueprint 的 width/height（§3.6、§14）；② 产出 `WEB_LITE_SCHEMA.md` 字段清单（待写，§16）；③ 单体 reroll **允许同 kind 改 footprint**（§7.1）；④ 区域 reroll **无 prompt、不走大模型**，纯 preset+seed+规则（§7.2、§12.3）；⑤ 区域 reroll **允许改 locked object 周围 terrain**（§7.2）；⑥ tileset 打包**复用引擎 palette export/import**，随 palette 推迟（§5）；⑦ 生成后端**先做 `claude -p`**（§10.2）。
+> **v2.4（2026-10-10 演进决议，见 `tilemap_editor_evolution_plan.md`）**：
+> 1. **独立轻量编辑器定位（D1）**：作为 desktop ImGui 编辑器的平级轻量版，数据模型保持为 desktop TileMap 的 lite 子集。
+> 2. **数据范式（D2）**：坚持「对象 + role + palette」语义模型，地表为每对象 `Int16Matrix`，不引入平铺全局瓦片网格。
+> 3. **交互规范（D3）**：保留 desktop 式 RMB 拾取/移动、LMB 工具操作、MMB 平移分工。
+> 4. **Tileset 策略（D4，重申 §3.2）**：网页内置只读图集包；未来由独立的 Tileset 编辑器生产规则与 pack。
+> 5. **生态目标（D5）**：专供 Adna 引擎，不外扩 Tiled/Godot。
+> 6. **生命周期解锁（D6，正式取代 §3.6）**：废除“永不新建地图、尺寸锁死”，允许新建空白地图、9 宫格锚点调整尺寸、保存与重新打开。
+>
+> **v2.3**：清空 §16 开放问题，定了 7 条 —— ① web 永不新建地图（已被 v2.4 D6 取代）；② 产出 `WEB_LITE_SCHEMA.md`；③ 单体 reroll 允许同 kind 改 footprint；④ 区域 reroll 无 prompt、不走大模型；⑤ 区域 reroll 允许改 locked object 周围 terrain；⑥ tileset 打包复用引擎 palette export/import；⑦ 生成后端先做 `claude -p`。
 >
 > **v2.2（本次）**：锁定两个工程选型 —— 代码放 **in-repo `web/reroll/`**（§12.2）；**第一刀只做 MVP 0**（overlay 平价）。palette/tileset preset 尚未就绪，故 **MVP 0.5（真实贴图 override）推迟**到 preset 准备好；MVP 0 只需统一的 role→color 表，不依赖 preset，故不阻塞（§13）。
 >
