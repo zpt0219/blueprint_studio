@@ -59,13 +59,17 @@ function styleOverlap(a: string, b: string): number {
 
 /** Min-distance tier (≤ MAX_DIST) for a role, ranked by style overlap desc. */
 function tierFor(palettes: Palette[], role: string, style: string): Palette[] {
+  let targetRole = role;
+  if (role === "terrain/cliff" && !palettes.some((p) => p.role.includes("cliff"))) {
+    targetRole = "terrain/grass";
+  }
   let best = Infinity;
   for (const p of palettes) {
-    const d = roleTreeDistance(role, p.role);
+    const d = roleTreeDistance(targetRole, p.role);
     if (d < best) best = d;
   }
   if (best > MAX_DIST) return [];
-  const tier = palettes.filter((p) => roleTreeDistance(role, p.role) === best);
+  const tier = palettes.filter((p) => roleTreeDistance(targetRole, p.role) === best);
   tier.sort((a, b) => styleOverlap(b.style, style) - styleOverlap(a.style, style));
   return tier;
 }

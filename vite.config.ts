@@ -7,6 +7,10 @@ import path from "path";
 export default defineConfig({
   base: "./",
   plugins: [react()],
+  server: {
+    host: true,
+    allowedHosts: true,
+  },
   resolve: {
     alias: {
       "@lib": path.resolve(__dirname, "./src/shared"),

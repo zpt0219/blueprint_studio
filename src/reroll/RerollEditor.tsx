@@ -3,19 +3,24 @@ import { parseBlueprint } from "./blueprint";
 import { blueprintToLite } from "./convert";
 import { normalizeToCategories } from "./normalize";
 import { DEFAULT_FRG_PLACEMENT_MODE, assignUniqueObjectNames, cloneObjectDeep, cloneTerrain, displayName, findLayer, findObject, isLocked, layerOfObject, roleOf, setTerrainCell, translateObject, type FrgCellData, type FrgPlacementMode, type HouseDecorationKind, type LiteObject, type LiteTileMap, type Rect } from "./model";
-import { UndoStack, bitwiseObjectCommand, createObjectCommand, createObjectsCommand, deleteObjectsCommand, moveHouseDecoCommand, moveObjectCommand, moveObjectsCommand, paintTerrainCommand, randomizeTerrainCommand, renameObjectCommand, reorderLayerObjectsCommand, resizeObjectCommand, setFrgCellsCommand, setFrgPlacementModeCommand, setHouseDecoPaletteCommand, setHouseDecorationsCommand, setHouseOverlapCommand, setHouseSlotPaletteCommand, setObjectRectCommand, setObjectsEnabledCommand, setObjectPaletteCommand, setObjectTypeCommand, setWallHeightCommand, terrainMutationWithTagsCommand, toggleLayerEnabledCommand, toggleObjectEnabledCommand, type Command, type LayerObjectSnapshot, type TerrainSnapshot } from "./commands";
+import { UndoStack, bitwiseObjectCommand, compositeCommand, createObjectCommand, createObjectsCommand, deleteObjectsCommand, moveHouseDecoCommand, moveObjectCommand, moveObjectsCommand, paintTerrainCommand, randomizeTerrainCommand, renameObjectCommand, reorderLayerObjectsCommand, resizeMapCommand, resizeObjectCommand, setFrgCellsCommand, setFrgPlacementModeCommand, setHouseDecoPaletteCommand, setHouseDecorationsCommand, setHouseOverlapCommand, setHouseSlotPaletteCommand, setObjectRectCommand, setObjectsEnabledCommand, setObjectPaletteCommand, setObjectTypeCommand, setWallHeightCommand, terrainMutationWithTagsCommand, toggleLayerEnabledCommand, toggleObjectEnabledCommand, type Command, type LayerObjectSnapshot, type TerrainSnapshot } from "./commands";
 import type { LiteType } from "./model";
 import { liteToWebSave } from "./saveFormat";
+import { createBlankMap, isWebSaveFile, webSaveToLite } from "./loadSave";
 import { clearDraft, loadDraft, saveDraft } from "./draft";
 import { downloadJson } from "./download";
 import { colorForRole } from "./generated/roleColors";
 import { applyBitwiseObjectOp, dilateTerrainMatrix, erodeTerrainMatrix, fillTerrainMatrix, flipTerrainMatrix, hasBitwiseOverlap, isBitwiseSupported, keepBorderTerrainMatrix, removeZeroLikeDesktop, terrainMatrixEquals, type BitwiseObjectOp } from "./bitwise";
 import { BitwiseObjectModal } from "./components/BitwiseObjectModal";
 import { CanvasView, type BrushState } from "./components/CanvasView";
+import { Hd2dView } from "./components/Hd2dView";
+import { type PlayerState } from "./hd2d/Hd2dWorld";
+import { NewMapModal, ResizeMapModal } from "./components/MapLifecycleModals";
 import { PalettePickerModal, type PaletteCreateRequest } from "./components/PalettePickerModal";
 import { PropsPanel } from "./components/PropsPanel";
+import { RoleTreeBrushPanel } from "./components/RoleTreeBrushPanel";
 import { loadPackFromUrl } from "./pack/loadPack";
-import { compileMap } from "./pack/compile";
+import { compileMap, resolvePaletteForRole } from "./pack/compile";
 import { PaletteMode, type Palette, type PackRuntime } from "./pack/types";
 import { isStructureMode } from "./pack/slice";
 import type { RenderMode } from "./render";
@@ -23,8 +28,18 @@ import { generateDecorations } from "./house";
 import { createObjectForRole, type CreateKind } from "./objectFactory";
 import { createKindsForRole, roleRoot } from "./roleTree";
 import { applyNoiseConfig, applyTerrainNoiseConfig, regenerateTerrainByNoise, type TerrainNoiseConfig } from "./terrainNoise";
+import {
+  brushFootprint,
+  ensureLayerForRole,
+  floodFillObjectTerrain,
+  inspectTileStack,
+  isMatrixBrushType,
+  objectCoversTile,
+  resolveOrCreateBrushTarget,
+  targetLiteTypeForRole,
+  type ActiveBrushConfig,
+} from "./fastBrush";
 
-const isTerrain = (o: LiteObject | null) => !!o && (o.type === "TERRAIN_2_CORNER" || o.type === "TERRAIN_2_EDGE");
 const borderAsConnected = (o: LiteObject) => o.tags["borderAsConnected"] === "true";
 
 type DropSide = "before" | "after";
@@ -167,6 +182,16 @@ function resizeTerrainToRect(terrain: TerrainSnapshot["terrain"], rect: Rect): T
   return next;
 }
 
+interface StrokeSession {
+  mode: "paint" | "erase";
+  targetId: number | null;
+  createdObj?: { layerId: number; objectId: number };
+  beforeMap: Map<number, TerrainSnapshot>;
+  dirty: boolean;
+}
+
+export type ViewLayout = "triple" | "tilemap_game" | "tilemap_scene" | "2d";
+
 export default function App() {
   const [lang, setLang] = useState<'zh' | 'en'>(() => {
     return (localStorage.getItem('adna_lang') as 'zh' | 'en') || 'zh';
@@ -178,14 +203,38 @@ export default function App() {
   const [pack, setPack] = useState<PackRuntime | null>(null);
   const [renderMode, setRenderMode] = useState<RenderMode>("mixed");
   const [packVersion, setPackVersion] = useState(0);
-  const [layersWidth, setLayersWidth] = useState(() => Number(localStorage.getItem("reroll_layers_w")) || 280);
+  const [viewLayout, setViewLayout] = useState<ViewLayout>("triple");
+  const [player, setPlayer] = useState<PlayerState>({ x: 24, y: 0, z: 18, facing: 1, walkPhase: 0 });
+  const [newMapOpen, setNewMapOpen] = useState(false);
+  const [resizeMapOpen, setResizeMapOpen] = useState(false);
+  const [layersWidth, setLayersWidth] = useState(() => Number(localStorage.getItem("reroll_layers_w")) || 320);
   // draggable width of the right props panel (px), persisted
-  const [propsWidth, setPropsWidth] = useState(() => Number(localStorage.getItem("reroll_props_w")) || 240);
+  const [propsWidth, setPropsWidth] = useState(() => Number(localStorage.getItem("reroll_props_w")) || 250);
+  // Split ratio between 2D TileMap and 3D Column (0.15 ~ 0.85, default 0.5)
+  const [viewSplitH, setViewSplitH] = useState<number>(() => {
+    const saved = Number(localStorage.getItem("reroll_view_split_h"));
+    return saved >= 0.15 && saved <= 0.85 ? saved : 0.5;
+  });
+  // Split ratio between 3D Scene View and 3D Game View (0.15 ~ 0.85, default 0.5)
+  const [viewSplitV, setViewSplitV] = useState<number>(() => {
+    const saved = Number(localStorage.getItem("reroll_view_split_v"));
+    return saved >= 0.15 && saved <= 0.85 ? saved : 0.5;
+  });
+  const [resizingSplit, setResizingSplit] = useState<"none" | "h" | "v">("none");
+  const stageRef = useRef<HTMLDivElement>(null);
+  const stackColRef = useRef<HTMLDivElement>(null);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   // one-shot Marquee tool armed (docs/SELECTION_MODEL.md); LMB box-selects, then pops back
   const [marquee, setMarquee] = useState(false);
-  const [brushSize, setBrushSize] = useState(3);
-  const [brushErase, setBrushErase] = useState(false);
+  const [brushConfig, setBrushConfig] = useState<ActiveBrushConfig>({
+    tool: "brush",
+    role: "terrain_decoration/path/road/area_path",
+    paletteHash: null,
+    size: 3,
+    shape: "square",
+    replaceSameLayer: false,
+    propStyle: "brush",
+  });
   // active layer = pure highlight + selection scope (not undoable, not exported)
   const [activeLayerId, setActiveLayerId] = useState<number | null>(null);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
@@ -202,14 +251,71 @@ export default function App() {
   const [clipboard, setClipboard] = useState<ObjectClipboard | null>(null);
   const [anchorId, setAnchorId] = useState<number | null>(null);
   const undo = useRef(new UndoStack());
-  const stroke = useRef<{ id: number; before: TerrainSnapshot; dirty: boolean } | null>(null);
+  const stroke = useRef<StrokeSession | null>(null);
   const decoDrag = useRef<{ id: number; index: number; before: [number, number] } | null>(null);
   const terrainNoisePreview = useRef<{ id: number; before: TerrainSnapshot; beforeTags: Record<string, string> } | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const saveTimer = useRef<number | null>(null);
 
+  const onChangeBrushConfig = useCallback((patch: Partial<ActiveBrushConfig>) => {
+    setBrushConfig((prev) => {
+      const next = { ...prev, ...patch };
+      if (patch.tool === "select") setMarquee(true);
+      else if (patch.tool) setMarquee(false);
+      return next;
+    });
+  }, []);
+
+  const applyNewMapState = useCallback((lite: LiteTileMap) => {
+    assignUniqueObjectNames(lite);
+    undo.current = new UndoStack();
+    setMap(lite);
+    setSelected(new Set());
+    setAnchorId(null);
+    setMarquee(false);
+    setClipboard(null);
+    setActiveLayerId(lite.layers[0]?.id ?? null);
+    setExpanded(new Set());
+
+    // Find player spawner or fallback to map center
+    let spawnX = Math.floor(lite.width / 2) + 0.5;
+    let spawnZ = Math.floor(lite.height / 2) + 0.5;
+    const spawnerLayer = lite.layers.find((l) => l.tags["role.root"] === "spawner" || l.name === "spawner");
+    const spawnerObj = spawnerLayer?.objects[0] || lite.layers.flatMap((l) => l.objects).find((o) => roleOf(o).includes("spawner"));
+    if (spawnerObj) {
+      spawnX = spawnerObj.rect[0] + spawnerObj.rect[2] / 2;
+      spawnZ = spawnerObj.rect[1] + spawnerObj.rect[3] / 2;
+    }
+
+    setPlayer({
+      x: spawnX,
+      y: 0,
+      z: spawnZ,
+      facing: 1,
+      walkPhase: 0,
+    });
+    terrainNoisePreview.current = null;
+    setVersion(0);
+    setError("");
+  }, []);
+
+  const onPlacePlayer = useCallback((tx: number, ty: number) => {
+    setPlayer((prev) => ({
+      ...prev,
+      x: tx + 0.5,
+      z: ty + 0.5,
+      walkPhase: 0,
+    }));
+  }, []);
+
   const build = useCallback((name: string, text: string) => {
-    let lite = normalizeToCategories(blueprintToLite(parseBlueprint(name, text)));
+    let lite: LiteTileMap;
+    const raw = JSON.parse(text);
+    if (isWebSaveFile(raw)) {
+      lite = webSaveToLite(raw);
+    } else {
+      lite = normalizeToCategories(blueprintToLite(parseBlueprint(name, text)));
+    }
     assignUniqueObjectNames(lite);
     // resume an unfinished local session for this source, if the user wants it
     const draft = loadDraft(name);
@@ -224,22 +330,18 @@ export default function App() {
         clearDraft(name);
       }
     }
-    undo.current = new UndoStack();
-    setMap(lite);
-    setSelected(new Set());
-    setAnchorId(null);
-    setMarquee(false);
-    setClipboard(null);
-    setActiveLayerId(lite.layers[0]?.id ?? null);
-    setExpanded(new Set());
-    terrainNoisePreview.current = null;
-    setVersion(0);
-    setError("");
-  }, []);
+    applyNewMapState(lite);
+  }, [lang, applyNewMapState]);
 
   const load = useCallback((name: string, text: string) => {
     build(name, text);
   }, [build]);
+
+  const onNewMap = useCallback((name: string, width: number, height: number, baseRole: string | null) => {
+    const lite = createBlankMap(name, width, height, baseRole);
+    applyNewMapState(lite);
+    setNewMapOpen(false);
+  }, [applyNewMapState]);
 
   const toggleExpand = useCallback((id: number) => {
     setExpanded((prev) => {
@@ -257,9 +359,9 @@ export default function App() {
 
   const loadSample = useCallback(async () => {
     try {
-      const res = await fetch(`${import.meta.env.BASE_URL}sample/test_village_strict.blueprint.json`);
+      const res = await fetch(`${import.meta.env.BASE_URL}sample/hd2d_test_village_32x32.adnaweb.json`);
       if (!res.ok) throw new Error(`sample 不可用 (${res.status})`);
-      load("test_village_strict (sample)", await res.text());
+      load("hd2d_test_village_32x32 (sample)", await res.text());
     } catch (e) { setError(`样例加载失败: ${(e as Error).message}`); }
   }, [load]);
 
@@ -306,7 +408,7 @@ export default function App() {
   const startLayersResize = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
     const onMove = (ev: MouseEvent) =>
-      setLayersWidth(Math.min(420, Math.max(220, ev.clientX)));
+      setLayersWidth(Math.min(460, Math.max(240, ev.clientX)));
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
@@ -337,6 +439,61 @@ export default function App() {
   }, []);
   useEffect(() => { localStorage.setItem("reroll_layers_w", String(layersWidth)); }, [layersWidth]);
   useEffect(() => { localStorage.setItem("reroll_props_w", String(propsWidth)); }, [propsWidth]);
+  useEffect(() => { localStorage.setItem("reroll_view_split_h", String(viewSplitH)); }, [viewSplitH]);
+  useEffect(() => { localStorage.setItem("reroll_view_split_v", String(viewSplitV)); }, [viewSplitV]);
+
+  // drag divider between 2D TileMap and 3D Column (horizontal split)
+  const startViewHResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const stage = stageRef.current;
+    if (!stage) return;
+    setResizingSplit("h");
+    const onMove = (ev: MouseEvent) => {
+      const rect = stage.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      const ratio = (ev.clientX - rect.left) / rect.width;
+      setViewSplitH(Math.min(0.85, Math.max(0.15, ratio)));
+    };
+    const onUp = () => {
+      setResizingSplit("none");
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }, []);
+
+  // drag divider between 3D Scene View and 3D Game View (vertical split)
+  const startViewVResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const stackCol = stackColRef.current;
+    if (!stackCol) return;
+    setResizingSplit("v");
+    const onMove = (ev: MouseEvent) => {
+      const rect = stackCol.getBoundingClientRect();
+      if (rect.height <= 0) return;
+      const ratio = (ev.clientY - rect.top) / rect.height;
+      setViewSplitV(Math.min(0.85, Math.max(0.15, ratio)));
+    };
+    const onUp = () => {
+      setResizingSplit("none");
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+  }, []);
+
+  const resetViewH = useCallback(() => setViewSplitH(0.5), []);
+  const resetViewV = useCallback(() => setViewSplitV(0.5), []);
 
   // autosave the edit session to localStorage (debounced) — only after a real
   // edit (version>0), so just opening a map doesn't create a phantom "resume?" draft
@@ -351,6 +508,12 @@ export default function App() {
   const run = useCallback((cmd: Command) => { undo.current.push(cmd); setVersion((v) => v + 1); }, []);
   const onUndo = useCallback(() => { undo.current.undo(); setVersion((v) => v + 1); }, []);
   const onRedo = useCallback(() => { undo.current.redo(); setVersion((v) => v + 1); }, []);
+
+  const onResizeMap = useCallback((newW: number, newH: number, anchorX: -1 | 0 | 1, anchorY: -1 | 0 | 1) => {
+    if (!map) return;
+    run(resizeMapCommand(map, newW, newH, anchorX, anchorY));
+    setResizeMapOpen(false);
+  }, [map, run]);
 
   const onExport = useCallback(() => {
     if (!map) return;
@@ -378,61 +541,336 @@ export default function App() {
     run({ label: lock ? "Lock" : "Unlock", do: () => apply(lock), undo: () => apply(!lock) });
   }, [map, selected, run]);
 
-  // --- terrain brush stroke (paints the SELECTED terrain object) ---
-  const paintDab = useCallback((id: number, tx: number, ty: number): boolean => {
-    if (!map) return false;
-    const o = findObject(map, id);
-    if (!o) return false;
-    const r = Math.floor(brushSize / 2);
-    let changed = false;
-    for (let dy = -r; dy <= r; dy++)
-      for (let dx = -r; dx <= r; dx++) {
-        const x = tx + dx, y = ty + dy;
-        if (x < 0 || y < 0 || x >= map.width || y >= map.height) continue;
-        if (setTerrainCell(o, x, y, !brushErase)) changed = true;
-      }
-    return changed;
-  }, [map, brushSize, brushErase]);
-
-  const onStrokeStart = useCallback((tx: number, ty: number) => {
-    if (!map || selected.size === 0) { stroke.current = null; return; }
-    const o = findObject(map, [...selected][0]);
-    if (!o || !isTerrain(o) || isLocked(o) || !o.terrain) { stroke.current = null; return; }
-    stroke.current = {
-      id: o.id,
-      before: { terrain: cloneTerrain(o.terrain), rect: [...o.rect] as Rect },
-      dirty: paintDab(o.id, tx, ty),
-    };
-  }, [map, selected, paintDab]);
-
-  const onStrokePaint = useCallback((tx: number, ty: number) => {
-    if (stroke.current && paintDab(stroke.current.id, tx, ty)) stroke.current.dirty = true;
-  }, [paintDab]);
-
-  const onStrokeEnd = useCallback(() => {
-    const s = stroke.current;
-    stroke.current = null;
-    if (!map || !s || !s.dirty) return;
-    const o = findObject(map, s.id);
-    if (!o || !o.terrain) return;
-    const after: TerrainSnapshot = { terrain: cloneTerrain(o.terrain), rect: [...o.rect] as Rect };
-    run(paintTerrainCommand(map, s.id, s.before, after));
-  }, [map, run]);
-
   // --- selection (single-layer; docs/SELECTION_MODEL.md) ---
   const revealLayer = useCallback((layerId: number) => {
     setActiveLayerId(layerId);
     setExpanded((prev) => new Set(prev).add(layerId));
   }, []);
 
-  // Replace selection with a single object (switch active layer, set anchor).
+  // Replace selection with a single object (switch active layer, set anchor, sync brush role).
   const selectSingle = useCallback((id: number) => {
     if (!map) return;
     const ly = layerOfObject(map, id);
     if (ly) revealLayer(ly.id);
+    const obj = findObject(map, id);
+    if (obj) {
+      const r = roleOf(obj);
+      if (r) {
+        const pHash = obj.tags["web.palette"] || (obj.frg && obj.frg.cells.length > 0 ? obj.frg.cells[0].palette : null) || null;
+        setBrushConfig((prev) => ({
+          ...prev,
+          role: r,
+          paletteHash: pHash,
+        }));
+      }
+    }
     setSelected(new Set([id]));
     setAnchorId(id);
   }, [map, revealLayer]);
+
+  // --- Fast Brush: resolve active palette and paint/erase/fill/eyedropper ---
+  const activeBrushPalette = useMemo<Palette | null>(() => {
+    if (!pack) return null;
+    if (brushConfig.paletteHash) {
+      const exact = pack.palettes.find((p) => p.hash === brushConfig.paletteHash);
+      if (exact) return exact;
+    }
+    const targetType = targetLiteTypeForRole(brushConfig.role, brushConfig.propStyle);
+    return resolvePaletteForRole(pack.palettes, brushConfig.role, "", 1, targetType) ?? null;
+  }, [pack, brushConfig.paletteHash, brushConfig.role, brushConfig.propStyle]);
+
+  const placeNonMatrixObjectAt = useCallback((tx: number, ty: number, overrideSize?: [number, number]) => {
+    if (!map) return;
+    const layer = ensureLayerForRole(map, brushConfig.role);
+    let maxId = -1;
+    for (const l of map.layers) for (const o of l.objects) maxId = Math.max(maxId, o.id);
+    const id = maxId + 1;
+    const targetType = targetLiteTypeForRole(brushConfig.role, brushConfig.propStyle);
+    if (targetType === "HOUSE") {
+      const wallPal = pack?.palettes.find((p) => p.role === HOUSE_WALL_ROLE && isStructureMode(p.mode)) ?? activeBrushPalette;
+      const roofPal = pack?.palettes.find((p) => p.role === HOUSE_ROOF_ROLE && isStructureMode(p.mode)) ?? activeBrushPalette;
+      const size: [number, number] = overrideSize ?? [
+        Math.max(3, wallPal?.size[0] ?? 4, roofPal?.size[0] ?? 4),
+        Math.max(3, (wallPal?.size[1] ?? 2) + (roofPal?.size[1] ?? 2) - 1),
+      ];
+      const created = createObjectForRole(map, id, HOUSE_CREATE_ROLE, "house", tx, ty, {
+        houseWallHash: wallPal?.hash,
+        houseRoofHash: roofPal?.hash,
+        size,
+        style: roofPal?.style || wallPal?.style,
+      });
+      if (created) {
+        run(createObjectCommand(map, layer.id, created));
+        selectSingle(id);
+      }
+      return;
+    }
+    const size: [number, number] = overrideSize ?? (activeBrushPalette?.size ? [activeBrushPalette.size[0], activeBrushPalette.size[1]] : [2, 2]);
+    const created = createObjectForRole(map, id, brushConfig.role, "fixed_rect", tx, ty, {
+      paletteHash: activeBrushPalette?.hash,
+      size,
+      style: activeBrushPalette?.style,
+    });
+    if (created) {
+      run(createObjectCommand(map, layer.id, created));
+      selectSingle(id);
+    }
+  }, [map, brushConfig.role, brushConfig.propStyle, pack, activeBrushPalette, run, selectSingle]);
+
+  const applySessionDab = useCallback((session: StrokeSession, tx: number, ty: number): boolean => {
+    if (!map) return false;
+    const cells = brushFootprint(tx, ty, brushConfig.size, brushConfig.shape, map.width, map.height);
+    let changed = false;
+
+    if (session.mode === "erase") {
+      if (session.targetId != null) {
+        const target = findObject(map, session.targetId);
+        if (!target || !target.terrain || isLocked(target)) return false;
+        if (!session.beforeMap.has(target.id)) {
+          session.beforeMap.set(target.id, { terrain: cloneTerrain(target.terrain), rect: [...target.rect] as Rect });
+        }
+        for (const [x, y] of cells) {
+          if (setTerrainCell(target, x, y, false)) changed = true;
+        }
+      } else {
+        const layer = ensureLayerForRole(map, brushConfig.role);
+        for (const obj of layer.objects) {
+          if (!obj.enabled || isLocked(obj) || !obj.terrain || !isMatrixBrushType(obj.type)) continue;
+          for (const [x, y] of cells) {
+            if (!objectCoversTile(obj, x, y)) continue;
+            if (!session.beforeMap.has(obj.id)) {
+              session.beforeMap.set(obj.id, { terrain: cloneTerrain(obj.terrain), rect: [...obj.rect] as Rect });
+            }
+            if (setTerrainCell(obj, x, y, false)) changed = true;
+          }
+        }
+      }
+      if (changed) session.dirty = true;
+      return changed;
+    }
+
+    if (session.targetId == null) return false;
+    const target = findObject(map, session.targetId);
+    if (!target || !target.terrain || isLocked(target)) return false;
+    const layer = layerOfObject(map, target.id);
+
+    for (const [x, y] of cells) {
+      if (setTerrainCell(target, x, y, true)) changed = true;
+      if (brushConfig.replaceSameLayer && layer) {
+        for (const other of layer.objects) {
+          if (other.id === target.id || !other.enabled || isLocked(other) || !other.terrain || !isMatrixBrushType(other.type)) continue;
+          if (!objectCoversTile(other, x, y)) continue;
+          if (!session.beforeMap.has(other.id)) {
+            session.beforeMap.set(other.id, { terrain: cloneTerrain(other.terrain), rect: [...other.rect] as Rect });
+          }
+          if (setTerrainCell(other, x, y, false)) changed = true;
+        }
+      }
+    }
+    if (changed) session.dirty = true;
+    return changed;
+  }, [map, brushConfig.size, brushConfig.shape, brushConfig.role, brushConfig.replaceSameLayer]);
+
+  const commitSessionCommand = useCallback((session: StrokeSession, label: string) => {
+    if (!map) return;
+    if (!session.dirty) {
+      if (session.createdObj) {
+        const ly = findLayer(map, session.createdObj.layerId);
+        if (ly) ly.objects = ly.objects.filter((o) => o.id !== session.createdObj!.objectId);
+      }
+      return;
+    }
+    const cmds: Command[] = [];
+    if (session.createdObj) {
+      const createdObj = findObject(map, session.createdObj.objectId);
+      if (createdObj) {
+        cmds.push(createObjectCommand(map, session.createdObj.layerId, createdObj));
+      }
+    }
+    for (const [objId, beforeSnap] of session.beforeMap) {
+      if (session.createdObj && objId === session.createdObj.objectId) continue;
+      const obj = findObject(map, objId);
+      if (!obj || !obj.terrain) continue;
+      const afterSnap: TerrainSnapshot = { terrain: cloneTerrain(obj.terrain), rect: [...obj.rect] as Rect };
+      cmds.push(paintTerrainCommand(map, objId, beforeSnap, afterSnap));
+    }
+    if (cmds.length === 1) run(cmds[0]);
+    else if (cmds.length > 1) run(compositeCommand(label, cmds));
+  }, [map, run]);
+
+  const onStrokeStart = useCallback((tx: number, ty: number) => {
+    if (!map) { stroke.current = null; return; }
+    if (brushConfig.tool === "eraser") {
+      const selFirst = selected.size === 1 ? findObject(map, [...selected][0]) : null;
+      const eraseTarget = selFirst && isMatrixBrushType(selFirst.type) && !isLocked(selFirst) && selFirst.terrain
+        ? selFirst.id
+        : null;
+      const session: StrokeSession = {
+        mode: "erase",
+        targetId: eraseTarget,
+        beforeMap: new Map(),
+        dirty: false,
+      };
+      if (applySessionDab(session, tx, ty)) setVersion((v) => v + 1);
+      stroke.current = session;
+      return;
+    }
+
+    const targetType = targetLiteTypeForRole(brushConfig.role, brushConfig.propStyle);
+    if (!isMatrixBrushType(targetType)) {
+      stroke.current = null;
+      placeNonMatrixObjectAt(tx, ty);
+      return;
+    }
+
+    const resolved = resolveOrCreateBrushTarget(
+      map,
+      brushConfig.role,
+      activeBrushPalette,
+      brushConfig.propStyle,
+      selected,
+    );
+    const beforeMap = new Map<number, TerrainSnapshot>();
+    if (!resolved.created && resolved.object.terrain) {
+      beforeMap.set(resolved.object.id, {
+        terrain: cloneTerrain(resolved.object.terrain),
+        rect: [...resolved.object.rect] as Rect,
+      });
+    }
+    const session: StrokeSession = {
+      mode: "paint",
+      targetId: resolved.object.id,
+      ...(resolved.created ? { createdObj: { layerId: resolved.layer.id, objectId: resolved.object.id } } : {}),
+      beforeMap,
+      dirty: false,
+    };
+    applySessionDab(session, tx, ty);
+    revealLayer(resolved.layer.id);
+    setSelected(new Set([resolved.object.id]));
+    setAnchorId(resolved.object.id);
+    setVersion((v) => v + 1);
+    stroke.current = session;
+  }, [map, brushConfig.tool, brushConfig.role, brushConfig.propStyle, selected, activeBrushPalette, applySessionDab, placeNonMatrixObjectAt, revealLayer]);
+
+  const onStrokePaint = useCallback((tx: number, ty: number) => {
+    const session = stroke.current;
+    if (!session) return;
+    if (applySessionDab(session, tx, ty)) {
+      setVersion((v) => v + 1);
+    }
+  }, [applySessionDab]);
+
+  const onStrokeEnd = useCallback(() => {
+    const session = stroke.current;
+    stroke.current = null;
+    if (!session) return;
+    commitSessionCommand(session, session.mode === "erase" ? "Erase tiles" : "Paint tiles");
+  }, [commitSessionCommand]);
+
+  const onRectFill = useCallback((loX: number, loY: number, hiX: number, hiY: number) => {
+    if (!map) return;
+    const clampedLoX = Math.max(0, Math.min(map.width - 1, loX));
+    const clampedLoY = Math.max(0, Math.min(map.height - 1, loY));
+    const clampedHiX = Math.max(0, Math.min(map.width - 1, hiX));
+    const clampedHiY = Math.max(0, Math.min(map.height - 1, hiY));
+    const w = clampedHiX - clampedLoX + 1;
+    const h = clampedHiY - clampedLoY + 1;
+
+    const targetType = targetLiteTypeForRole(brushConfig.role, brushConfig.propStyle);
+    if (!isMatrixBrushType(targetType)) {
+      placeNonMatrixObjectAt(clampedLoX, clampedLoY, [Math.max(1, w), Math.max(1, h)]);
+      return;
+    }
+
+    const resolved = resolveOrCreateBrushTarget(
+      map,
+      brushConfig.role,
+      activeBrushPalette,
+      brushConfig.propStyle,
+      selected,
+    );
+    const beforeMap = new Map<number, TerrainSnapshot>();
+    if (!resolved.created && resolved.object.terrain) {
+      beforeMap.set(resolved.object.id, {
+        terrain: cloneTerrain(resolved.object.terrain),
+        rect: [...resolved.object.rect] as Rect,
+      });
+    }
+    const session: StrokeSession = {
+      mode: "paint",
+      targetId: resolved.object.id,
+      ...(resolved.created ? { createdObj: { layerId: resolved.layer.id, objectId: resolved.object.id } } : {}),
+      beforeMap,
+      dirty: false,
+    };
+    for (let y = clampedLoY; y <= clampedHiY; y++) {
+      for (let x = clampedLoX; x <= clampedHiX; x++) {
+        if (setTerrainCell(resolved.object, x, y, true)) session.dirty = true;
+        if (brushConfig.replaceSameLayer) {
+          for (const other of resolved.layer.objects) {
+            if (other.id === resolved.object.id || !other.enabled || isLocked(other) || !other.terrain || !isMatrixBrushType(other.type)) continue;
+            if (!objectCoversTile(other, x, y)) continue;
+            if (!session.beforeMap.has(other.id)) {
+              session.beforeMap.set(other.id, { terrain: cloneTerrain(other.terrain), rect: [...other.rect] as Rect });
+            }
+            if (setTerrainCell(other, x, y, false)) session.dirty = true;
+          }
+        }
+      }
+    }
+    revealLayer(resolved.layer.id);
+    setSelected(new Set([resolved.object.id]));
+    setAnchorId(resolved.object.id);
+    commitSessionCommand(session, "Rect fill");
+  }, [map, brushConfig.role, brushConfig.propStyle, brushConfig.replaceSameLayer, activeBrushPalette, selected, placeNonMatrixObjectAt, revealLayer, commitSessionCommand]);
+
+  const onBucketFill = useCallback((tx: number, ty: number) => {
+    if (!map) return;
+    const targetType = targetLiteTypeForRole(brushConfig.role, brushConfig.propStyle);
+    if (!isMatrixBrushType(targetType)) {
+      placeNonMatrixObjectAt(tx, ty);
+      return;
+    }
+    const resolved = resolveOrCreateBrushTarget(
+      map,
+      brushConfig.role,
+      activeBrushPalette,
+      brushConfig.propStyle,
+      selected,
+    );
+    const beforeMap = new Map<number, TerrainSnapshot>();
+    if (!resolved.created && resolved.object.terrain) {
+      beforeMap.set(resolved.object.id, {
+        terrain: cloneTerrain(resolved.object.terrain),
+        rect: [...resolved.object.rect] as Rect,
+      });
+    }
+    const session: StrokeSession = {
+      mode: "paint",
+      targetId: resolved.object.id,
+      ...(resolved.created ? { createdObj: { layerId: resolved.layer.id, objectId: resolved.object.id } } : {}),
+      beforeMap,
+      dirty: floodFillObjectTerrain(map, resolved.object, tx, ty, true),
+    };
+    revealLayer(resolved.layer.id);
+    setSelected(new Set([resolved.object.id]));
+    setAnchorId(resolved.object.id);
+    commitSessionCommand(session, "Flood fill");
+  }, [map, brushConfig.role, brushConfig.propStyle, activeBrushPalette, selected, placeNonMatrixObjectAt, revealLayer, commitSessionCommand]);
+
+  const onEyedropper = useCallback((tx: number, ty: number) => {
+    if (!map) return;
+    const stack = inspectTileStack(map, tx, ty);
+    if (stack.length === 0) return;
+    const top = stack[stack.length - 1];
+    setBrushConfig((prev) => ({
+      ...prev,
+      tool: "brush",
+      role: top.role || prev.role,
+      paletteHash: top.paletteHash ?? null,
+    }));
+    selectSingle(top.objectId);
+  }, [map, selectSingle]);
 
   // Ctrl-toggle membership; only within the active layer (else switch + single).
   const toggleSelect = useCallback((id: number) => {
@@ -1191,9 +1629,9 @@ export default function App() {
   }, [createKind, selectedCreateChoice, selectedCreateHouseWall, selectedCreateHouseRoof]);
 
   useEffect(() => {
-      const onKey = (e: KeyboardEvent) => {
-        const tag = (e.target as HTMLElement)?.tagName;
-        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
         e.preventDefault();
         if (e.shiftKey) onRedo(); else onUndo();
@@ -1220,13 +1658,50 @@ export default function App() {
         return;
       }
       if (!e.metaKey && !e.ctrlKey && !e.altKey && map) {
-        if (e.key.toLowerCase() === "m") { e.preventDefault(); setMarquee((m) => !m); }
-        else if (e.key === "Escape") { setMarquee(false); setCreateArmed(false); setCreateModalOpen(false); onCloseBitwise(); }
+        const k = e.key.toLowerCase();
+        if (k === "m") {
+          e.preventDefault();
+          setMarquee((m) => {
+            const next = !m;
+            setBrushConfig((prev) => ({ ...prev, tool: next ? "select" : "brush" }));
+            return next;
+          });
+        } else if (k === "b") {
+          e.preventDefault();
+          onChangeBrushConfig({ tool: "brush" });
+        } else if (k === "e") {
+          e.preventDefault();
+          onChangeBrushConfig({ tool: "eraser" });
+        } else if (k === "u") {
+          e.preventDefault();
+          onChangeBrushConfig({ tool: "rect" });
+        } else if (k === "g") {
+          e.preventDefault();
+          onChangeBrushConfig({ tool: "bucket" });
+        } else if (k === "i") {
+          e.preventDefault();
+          onChangeBrushConfig({ tool: "eyedropper" });
+        } else if (e.key === "[" || e.key === "]") {
+          e.preventDefault();
+          const sizes = [1, 2, 3, 5, 7];
+          setBrushConfig((prev) => {
+            const idx = Math.max(0, sizes.indexOf(prev.size));
+            const nextIdx = e.key === "[" ? Math.max(0, idx - 1) : Math.min(sizes.length - 1, idx + 1);
+            return { ...prev, size: sizes[nextIdx] };
+          });
+        } else if (e.key === "Escape") {
+          setMarquee(false);
+          setCreateArmed(false);
+          setCreateModalOpen(false);
+          setNewMapOpen(false);
+          setResizeMapOpen(false);
+          onCloseBitwise();
+        }
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onUndo, onRedo, map, selected.size, canPaste, onCopySelection, onPasteClipboard, onDuplicateSelection, onDeleteSelection, onCloseBitwise]);
+  }, [onUndo, onRedo, map, selected.size, canPaste, onCopySelection, onPasteClipboard, onDuplicateSelection, onDeleteSelection, onCloseBitwise, onChangeBrushConfig]);
 
   const selObjs = useMemo(() => (map ? ([...selected].map((id) => findObject(map, id)).filter(Boolean) as LiteObject[]) : []), [map, selected, version]);
   const bitwiseTarget = useMemo(() => (map && bitwiseTargetId != null ? findObject(map, bitwiseTargetId) : null), [map, bitwiseTargetId, version]);
@@ -1307,14 +1782,14 @@ export default function App() {
       onApply: onApplyBitwise,
     };
   }, [map, bitwiseTarget, bitwiseSources, bitwiseSourceId, onApplyBitwise]);
-  const selObj = selObjs[0] ?? null;
-  const selIsTerrain = isTerrain(selObj);
-  const selLocked = selObj ? isLocked(selObj) : false;
+
+  const brushRgb = useMemo(() => colorForRole(brushConfig.role), [brushConfig.role]);
   const brush: BrushState = {
-    rgb: selObj ? colorForRole(roleOf(selObj)) : [255, 255, 255],
-    size: brushSize,
-    erase: brushErase,
-    ready: selIsTerrain && !selLocked,
+    rgb: brushRgb,
+    size: brushConfig.size,
+    erase: brushConfig.tool === "eraser",
+    ready: brushConfig.tool !== "select",
+    tool: brushConfig.tool,
   };
   const canUndo = undo.current.canUndo;
   const canRedo = undo.current.canRedo;
@@ -1322,26 +1797,60 @@ export default function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <strong>Adna Web Lite Reroll</strong>
-        <span className="badge">{lang === 'zh' ? '右键选/移 · 左键涂/缩放' : 'Right-click select/move · Left-click paint/zoom'}</span>
-        <button onClick={() => fileInput.current?.click()}>{lang === 'zh' ? '打开 blueprint.json…' : 'Open blueprint.json…'}</button>
+        <strong>Blueprint Studio · HD-2D</strong>
+        <button onClick={() => setNewMapOpen(true)} title={lang === "zh" ? "新建 7层结构空白地图" : "Create new 7-layer map"}>
+          🗺️ {lang === "zh" ? "新建" : "New"}
+        </button>
+        <button onClick={() => fileInput.current?.click()}>
+          📂 {lang === 'zh' ? '打开蓝图/存档…' : 'Open Blueprint/Save…'}
+        </button>
         <input ref={fileInput} type="file" accept=".json" hidden
           onChange={(e) => e.target.files?.[0] && loadFile(e.target.files[0])} />
         {map && (
           <>
+            <button onClick={() => setResizeMapOpen(true)} title={lang === "zh" ? "调整地图宽高尺寸 (9宫格锚点)" : "Resize Map Dimensions"}>
+              📐 {map.width}×{map.height}
+            </button>
             <button disabled={!canUndo} onClick={onUndo} title={lang === 'zh' ? "撤销 (Cmd/Ctrl+Z)" : "Undo (Cmd/Ctrl+Z)"}>↶ Undo</button>
             <button disabled={!canRedo} onClick={onRedo} title={lang === 'zh' ? "重做 (Shift+Cmd/Ctrl+Z)" : "Redo (Shift+Cmd/Ctrl+Z)"}>↷ Redo</button>
-            <button onClick={onExport} title={lang === 'zh' ? "导出 adna-web-lite 存档" : "Export Save File"}>⤓ Export</button>
+            <button onClick={onExport} title={lang === 'zh' ? "导出 adna-web-lite 存档 (支持直接再打开)" : "Export Save File"}>⤓ {lang === "zh" ? "保存" : "Save"}</button>
             <button disabled={selected.size === 0} onClick={onCopySelection} title={lang === 'zh' ? "复制当前对象/组到内部剪贴板 (Cmd/Ctrl+C)" : "Copy current object/group to clipboard (Cmd/Ctrl+C)"}>⧉ Copy</button>
             <button disabled={!canPaste} onClick={onPasteClipboard} title={pasteTitle}>⎘ Paste</button>
-            <button disabled={selected.size === 0} onClick={onDeleteSelection} title={lang === 'zh' ? "删除当前对象/组 (Delete)" : "Delete current object/group (Delete)"}>⌫ Delete</button>
-            <button className={marquee ? "active" : ""} onClick={() => {
-              setMarquee((m) => {
-                const next = !m;
-                if (next) setCreateArmed(false);
-                return next;
-              });
-            }} title={lang === 'zh' ? "框选工具(M)：左键拖一次框选,松手自动退回" : "Marquee Selection Tool (M): drag left click to select, releases automatically"}>▭ {lang === 'zh' ? '框选' : 'Marquee'}</button>
+            <button disabled={selected.size === 0} onClick={onDeleteSelection} title={lang === 'zh' ? "删除当前对象/组 (Delete)" : "Delete current object/group (Delete)"}>⌫ Del</button>
+
+            <span className="ts-sep" />
+            <span className="ts-label">{lang === "zh" ? "视口" : "Viewports"}</span>
+            <span className="seg">
+              <button
+                className={viewLayout === "triple" ? "active" : ""}
+                onClick={() => setViewLayout("triple")}
+                title={lang === "zh" ? "左: 2D TileMap 编辑 · 右上: 3D Scene 自由观察/选中 · 右下: 3D Game 锁定玩家视角" : "Left: 2D TileMap Edit · Top-Right: 3D Scene View · Bottom-Right: 3D Game View"}
+              >
+                {lang === "zh" ? "三视口 (TileMap + Scene + Game)" : "Triple (TileMap + Scene + Game)"}
+              </button>
+              <button
+                className={viewLayout === "tilemap_game" ? "active" : ""}
+                onClick={() => setViewLayout("tilemap_game")}
+                title={lang === "zh" ? "左: 2D TileMap 编辑 · 右: 3D Game 玩家视角" : "Left: 2D TileMap Edit · Right: 3D Game View"}
+              >
+                TileMap + Game
+              </button>
+              <button
+                className={viewLayout === "tilemap_scene" ? "active" : ""}
+                onClick={() => setViewLayout("tilemap_scene")}
+                title={lang === "zh" ? "左: 2D TileMap 编辑 · 右: 3D Scene 自由观察/选中" : "Left: 2D TileMap Edit · Right: 3D Scene View"}
+              >
+                TileMap + Scene
+              </button>
+              <button
+                className={viewLayout === "2d" ? "active" : ""}
+                onClick={() => setViewLayout("2d")}
+                title={lang === "zh" ? "全屏 2D TileMap 平面编辑" : "Full-screen 2D TileMap Editor"}
+              >
+                {lang === "zh" ? "仅 2D TileMap" : "2D TileMap"}
+              </button>
+            </span>
+
             {pack && (
               <>
                 <span className="ts-sep" />
@@ -1353,29 +1862,13 @@ export default function App() {
                 </span>
               </>
             )}
-            {selIsTerrain && (
-              <>
-                <span className="ts-sep" />
-                <span className="ts-label">Brush · <code>{roleOf(selObj!)}</code></span>
-                <span className="seg">
-                  {[1, 3, 5].map((n) => (
-                    <button key={n} className={brushSize === n ? "active" : ""} onClick={() => setBrushSize(n)}>{n}</button>
-                  ))}
-                </span>
-                <span className="seg">
-                  <button className={!brushErase ? "active" : ""} onClick={() => setBrushErase(false)}>{lang === 'zh' ? '绘制' : 'Paint'}</button>
-                  <button className={brushErase ? "active" : ""} onClick={() => setBrushErase(true)}>{lang === 'zh' ? '擦除' : 'Erase'}</button>
-                </span>
-                {selLocked && <span className="muted small">{lang === 'zh' ? '已锁定' : 'Locked'}</span>}
-              </>
-            )}
           </>
         )}
         <span className="spacer" />
         {map && <span className="stat">{map.name}{version > 0 && <em className="muted">{lang === 'zh' ? ' · 进度已存本地' : ' · Saved locally'}</em>}</span>}
         <button
           style={{
-            marginLeft: '12px',
+            marginLeft: '8px',
             background: 'rgba(255,255,255,0.06)',
             border: '1px solid rgba(255,255,255,0.1)',
             padding: '3px 8px',
@@ -1390,7 +1883,7 @@ export default function App() {
             localStorage.setItem('adna_lang', nextLang);
           }}
         >
-          🌐 {lang === 'zh' ? 'English' : '简体中文'}
+          🌐 {lang === 'zh' ? 'EN' : '中文'}
         </button>
       </header>
 
@@ -1398,114 +1891,175 @@ export default function App() {
 
       {!map ? (
         <div className="dropzone">
-          <div>{lang === 'zh' ? <>把 <code>blueprint.json</code> 拖到这里，或点「打开 blueprint.json…」</> : <>Drag <code>blueprint.json</code> here, or click "Open blueprint.json..."</>}</div>
-          <button onClick={loadSample}>{lang === 'zh' ? '试用样例' : 'Try Sample'}</button>
+          <div>{lang === 'zh' ? <>把 <code>blueprint.json</code> 或 <code>.adnaweb.json</code> 拖到这里，或点击上方「新建 / 打开」</> : <>Drag <code>blueprint.json</code> or <code>.adnaweb.json</code> here, or click "New / Open"</>}</div>
+          <div style={{ display: "flex", gap: 10 }}>
+            <button onClick={loadSample}>{lang === 'zh' ? '试用村庄样例' : 'Try Village Sample'}</button>
+            <button onClick={() => setNewMapOpen(true)}>{lang === 'zh' ? '新建空白 7层地图' : 'New Blank 7-Layer Map'}</button>
+          </div>
         </div>
       ) : (
         <div className="main" style={{ "--layers-w": `${layersWidth}px`, "--props-w": `${propsWidth}px` } as CSSProperties}>
-          <aside className="layers">
-            <div className="layers-head">
-              <span className="legend-title">Layers</span>
-              <div className="layers-actions">
-                <button
-                  className={createArmed ? "active" : ""}
-                  disabled={!activeLayer || createKindOptions.length === 0}
-                  onClick={openCreateModal}
-                  title="选择类型和 palette，然后点击地图放置"
-                >
-                  Add Obj
-                </button>
-                <button disabled={selected.size === 0} onClick={onDuplicateSelection} title="复制当前对象/组">Dup Obj</button>
-                <button disabled={selected.size === 0} onClick={onDeleteSelection} title="删除当前对象/组">Del Obj</button>
-              </div>
-            </div>
+          <RoleTreeBrushPanel
+            map={map}
+            pack={pack}
+            lang={lang}
+            brushConfig={brushConfig}
+            onChangeBrushConfig={onChangeBrushConfig}
+            activeLayerId={activeLayerId}
+            selected={selected}
+            expandedLayers={expanded}
+            onSelectLayer={(layerId) => setActiveLayerId(layerId)}
+            onToggleExpandLayer={toggleExpand}
+            onToggleLayerEnabled={onToggleLayer}
+            onToggleObjectEnabled={onToggleObject}
+            onObjectClick={onObjectClick}
+            onOpenCreateModal={openCreateModal}
+            onDuplicateSelection={onDuplicateSelection}
+            onDeleteSelection={onDeleteSelection}
+            draggingObjectId={dragging?.objectId ?? null}
+            dropTarget={dropTarget}
+            onObjectDragStart={onObjectDragStart}
+            onObjectDragOver={onObjectDragOver}
+            onObjectDrop={onObjectDrop}
+            onObjectDragEnd={onObjectDragEnd}
+          />
+          <div className="resizer left-resizer" onMouseDown={startLayersResize} title="拖动调整左栏宽度" />
+
+          <div
+            ref={stageRef}
+            className={`viewport-stage layout-${viewLayout}${resizingSplit !== "none" ? " is-resizing-views" : ""}`}
+          >
             {createArmed && createPlacementLabel && (
-              <div className="prop-hint layer-hint">
-                Click map to place {createPlacementLabel}. Press Esc to cancel.
+              <div className="create-armed-banner">
+                Click map to place <strong>{createPlacementLabel}</strong> · Press Esc to cancel
               </div>
             )}
-            {map.layers.map((ly) => {
-              const open = expanded.has(ly.id);
-              return (
-                <div key={ly.id} className="layer-group">
-                  <div
-                    className={`layer-row${ly.id === activeLayerId ? " active" : ""}${ly.enabled ? "" : " hidden"}`}
-                    onClick={() => { setActiveLayerId(ly.id); toggleExpand(ly.id); }}
-                  >
-                    <button className="caret" onClick={(e) => { e.stopPropagation(); toggleExpand(ly.id); }}>
-                      {open ? "▾" : "▸"}
-                    </button>
-                    <input
-                      className="row-check"
-                      type="checkbox"
-                      checked={ly.enabled}
-                      title={ly.enabled ? "显示" : "隐藏"}
-                      onChange={() => onToggleLayer(ly.id)}
-                      onClick={(e) => { e.stopPropagation(); }}
+            <div
+              className="canvas-panel-wrap"
+              style={{
+                flex: viewLayout === "2d" ? "1 1 100%" : `0 0 ${viewSplitH * 100}%`,
+                width: viewLayout === "2d" ? "100%" : undefined,
+                minWidth: 0,
+                height: "100%",
+                display: "flex",
+                position: "relative",
+              }}
+            >
+              <CanvasView
+                map={map}
+                version={version}
+                pack={pack}
+                bindings={bindings}
+                renderMode={renderMode}
+                packVersion={packVersion}
+                onHouseDecoStart={onHouseDecoStart}
+                onHouseDecoMove={onHouseDecoMove}
+                onHouseDecoEnd={onHouseDecoEnd}
+                brush={brush}
+                selected={selected}
+                marqueeArmed={marquee || brushConfig.tool === "select"}
+                createArmed={createArmed}
+                playerPos={[player.x, player.z]}
+                onPlacePlayer={onPlacePlayer}
+                onPick={onPick}
+                onCreateAt={onCreateAt}
+                onCopySelection={onCopySelection}
+                canPasteClipboard={canPaste}
+                onPasteClipboard={onPasteClipboard}
+                onDeleteSelection={onDeleteSelection}
+                onMove={onMove}
+                onMoveGroup={onMoveGroup}
+                onResize={onResize}
+                onToggleLock={onToggleLock}
+                onStrokeStart={onStrokeStart}
+                onStrokePaint={onStrokePaint}
+                onStrokeEnd={onStrokeEnd}
+                onRectFill={onRectFill}
+                onBucketFill={onBucketFill}
+                onEyedropper={onEyedropper}
+                onMarquee={onMarquee}
+                onMarqueeDone={() => setMarquee(false)}
+              />
+            </div>
+            {viewLayout !== "2d" && (
+              <>
+                <div
+                  className="view-resizer view-resizer-col"
+                  onMouseDown={startViewHResize}
+                  onDoubleClick={resetViewH}
+                  title={lang === "zh" ? "左右拖动调整 2D 与 3D 视图宽度 (双击居中 50%)" : "Drag to resize 2D & 3D width (Double-click for 50%)"}
+                />
+                <div
+                  ref={stackColRef}
+                  className="hd2d-stack-column"
+                  style={{ flex: 1, minWidth: 0, height: "100%" }}
+                >
+                  {(viewLayout === "triple" || viewLayout === "tilemap_scene") && (
+                    <div
+                      className="hd2d-panel-wrap scene-panel-wrap"
+                      style={{
+                        flex: viewLayout === "triple" ? `0 0 ${viewSplitV * 100}%` : "1 1 100%",
+                        height: viewLayout === "triple" ? undefined : "100%",
+                        minHeight: 0,
+                        position: "relative",
+                        display: "flex",
+                      }}
+                    >
+                      <Hd2dView
+                        viewRole="scene"
+                        map={map}
+                        version={version}
+                        pack={pack}
+                        bindings={bindings}
+                        renderMode={renderMode}
+                        packVersion={packVersion}
+                        selected={selected}
+                        player={player}
+                        onChangePlayer={setPlayer}
+                        onPickObject={onPick}
+                        lang={lang}
+                      />
+                    </div>
+                  )}
+                  {viewLayout === "triple" && (
+                    <div
+                      className="view-resizer view-resizer-row"
+                      onMouseDown={startViewVResize}
+                      onDoubleClick={resetViewV}
+                      title={lang === "zh" ? "上下拖动调整 Scene 与 Game 视图高度 (双击居中 50%)" : "Drag to resize Scene & Game height (Double-click for 50%)"}
                     />
-                    <span className="layer-name" title={ly.name}>{ly.name}</span>
-                    <span className="layer-count">{ly.objects.length}</span>
-                  </div>
-                  {open && ly.objects.map((o) => {
-                    const label = displayName(o);
-                    return (
-                      <div
-                        key={o.id}
-                        className={`obj-row${selected.has(o.id) ? " selected" : ""}${o.enabled ? "" : " hidden"}${dragging?.objectId === o.id ? " dragging" : ""}${dropTarget?.layerId === ly.id && dropTarget.targetId === o.id ? ` drop-${dropTarget.side}` : ""}`}
-                        draggable
-                        onClick={(e) => onObjectClick(o.id, { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey })}
-                        onDragStart={onObjectDragStart(ly.id, o.id)}
-                        onDragOver={onObjectDragOver(ly.id, o.id)}
-                        onDrop={onObjectDrop(ly.id, o.id)}
-                        onDragEnd={onObjectDragEnd}
-                      >
-                        <input
-                          className="row-check"
-                          type="checkbox"
-                          checked={o.enabled}
-                          title={o.enabled ? "显示" : "隐藏"}
-                          onChange={() => onToggleObject(o.id)}
-                          onClick={(e) => { e.stopPropagation(); }}
-                        />
-                        <span className="obj-name" title={label}>{label}</span>
-                      </div>
-                    );
-                  })}
+                  )}
+                  {(viewLayout === "triple" || viewLayout === "tilemap_game") && (
+                    <div
+                      className="hd2d-panel-wrap game-panel-wrap"
+                      style={{
+                        flex: 1,
+                        minHeight: 0,
+                        height: viewLayout === "tilemap_game" ? "100%" : undefined,
+                        position: "relative",
+                        display: "flex",
+                      }}
+                    >
+                      <Hd2dView
+                        viewRole="game"
+                        map={map}
+                        version={version}
+                        pack={pack}
+                        bindings={bindings}
+                        renderMode={renderMode}
+                        packVersion={packVersion}
+                        selected={selected}
+                        player={player}
+                        onChangePlayer={setPlayer}
+                        lang={lang}
+                      />
+                    </div>
+                  )}
                 </div>
-              );
-            })}
-          </aside>
-          <div className="resizer left-resizer" onMouseDown={startLayersResize} title="拖动调整左栏宽度" />
-          <CanvasView
-            map={map}
-            version={version}
-            pack={pack}
-            bindings={bindings}
-            renderMode={renderMode}
-            packVersion={packVersion}
-            onHouseDecoStart={onHouseDecoStart}
-            onHouseDecoMove={onHouseDecoMove}
-            onHouseDecoEnd={onHouseDecoEnd}
-            brush={brush}
-            selected={selected}
-            marqueeArmed={marquee}
-            createArmed={createArmed}
-            onPick={onPick}
-            onCreateAt={onCreateAt}
-            onCopySelection={onCopySelection}
-            canPasteClipboard={canPaste}
-            onPasteClipboard={onPasteClipboard}
-            onDeleteSelection={onDeleteSelection}
-            onMove={onMove}
-            onMoveGroup={onMoveGroup}
-            onResize={onResize}
-            onToggleLock={onToggleLock}
-            onStrokeStart={onStrokeStart}
-            onStrokePaint={onStrokePaint}
-            onStrokeEnd={onStrokeEnd}
-            onMarquee={onMarquee}
-            onMarqueeDone={() => setMarquee(false)}
-          />
+              </>
+            )}
+          </div>
+
           <div className="resizer right-resizer" onMouseDown={startPropsResize} title="拖动调整右栏宽度" />
           <PropsPanel
             layer={activeLayer}
@@ -1545,6 +2099,22 @@ export default function App() {
           <PalettePickerModal pack={pack} request={createPickerRequest} onClose={() => setCreateModalOpen(false)} />
           <BitwiseObjectModal request={bitwiseRequest} onClose={onCloseBitwise} />
         </div>
+      )}
+      <NewMapModal
+        open={newMapOpen}
+        lang={lang}
+        onClose={() => setNewMapOpen(false)}
+        onCreate={onNewMap}
+      />
+      {map && (
+        <ResizeMapModal
+          open={resizeMapOpen}
+          lang={lang}
+          currentWidth={map.width}
+          currentHeight={map.height}
+          onClose={() => setResizeMapOpen(false)}
+          onResize={onResizeMap}
+        />
       )}
     </div>
   );

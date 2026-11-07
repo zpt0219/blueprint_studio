@@ -21,13 +21,14 @@ import {
 import type { PackRuntime } from "../pack/types";
 import type { Bindings } from "../pack/compile";
 import { clampDecoCell, decorationAt, effectiveDecorationCell } from "../house";
+import { bresenhamLine, inspectTileStack, type BrushToolId, type TileStackItem } from "../fastBrush";
 
 export interface BrushState {
   rgb: RGB;
   size: number;
   erase: boolean;
-  /** true when the selected object is a terrain object (so LMB paints) */
   ready: boolean;
+  tool?: BrushToolId;
 }
 
 interface Props {
@@ -55,7 +56,7 @@ interface Props {
   onCreateAt: (tx: number, ty: number) => void;
   onCopySelection: () => void;
   canPasteClipboard: boolean;
-  onPasteClipboard: () => void;
+  onPasteClipboard: boolean | (() => void);
   onDeleteSelection: () => void;
   onMove: (id: number, before: [number, number], after: [number, number]) => void;
   onMoveGroup: (ids: number[], dx: number, dy: number) => void;
@@ -64,6 +65,11 @@ interface Props {
   onStrokeStart: (tx: number, ty: number) => void;
   onStrokePaint: (tx: number, ty: number) => void;
   onStrokeEnd: () => void;
+  onRectFill?: (loX: number, loY: number, hiX: number, hiY: number) => void;
+  onBucketFill?: (tx: number, ty: number) => void;
+  onEyedropper?: (tx: number, ty: number) => void;
+  playerPos?: [number, number];
+  onPlacePlayer?: (tx: number, ty: number) => void;
   /** marquee released after a drag: select active-layer objects in the tile box */
   onMarquee: (loX: number, loY: number, hiX: number, hiY: number, additive: boolean) => void;
   /** marquee gesture finished (drag or click) → disarm the one-shot tool */
@@ -73,14 +79,14 @@ interface Props {
 interface Edges { l: boolean; r: boolean; t: boolean; b: boolean; }
 
 interface Gesture {
-  mode: "pan" | "move" | "resize" | "paint" | "marquee" | "deco";
+  mode: "pan" | "move" | "resize" | "paint" | "rect_brush" | "marquee" | "deco";
   downX: number;
   downY: number;
   downFx: number;
   downFy: number;
   downSx?: number; // canvas-relative px at press (marquee anchor)
   downSy?: number;
-  startTx?: number; // tile at press (marquee / pick)
+  startTx?: number; // tile at press (marquee / pick / rect_brush)
   startTy?: number;
   lastX: number;
   lastY: number;
@@ -115,8 +121,6 @@ const MIN_SCALE = 0.5;
 const MAX_SCALE = 64;
 const CLICK_SLOP = 4;
 const EDGE_MARGIN = 6; // px grab zone around a FIXED_RECT edge
-
-const isTerrain = (o: LiteObject) => o.type === "TERRAIN_2_CORNER" || o.type === "TERRAIN_2_EDGE";
 
 // Which edges of `rect` (screen px) the cursor is near, or inside/outside.
 function edgeGrab(view: View, rect: Rect, sx: number, sy: number): Edges | "inside" | "outside" {
@@ -176,15 +180,13 @@ function cursorFor(edges: Edges | "inside" | "outside"): string {
 export function CanvasView({
   map, version, pack, bindings, renderMode, packVersion, onHouseDecoStart, onHouseDecoMove, onHouseDecoEnd, brush, selected, marqueeArmed, createArmed,
   onPick, onCreateAt, onCopySelection, canPasteClipboard, onPasteClipboard, onDeleteSelection, onMove, onMoveGroup, onResize, onToggleLock, onStrokeStart, onStrokePaint, onStrokeEnd,
+  onRectFill, onBucketFill, onEyedropper, playerPos, onPlacePlayer,
   onMarquee, onMarqueeDone,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<View>({ scale: 8, offX: 0, offY: 0 });
   const hitRef = useRef<HitGrid>(buildHitGrid(map, pack && bindings ? { pack, bindings, renderMode } : null));
-  // Cached static scene (KRAFT + objects + terrain); blitted every frame. Only
-  // re-rendered when map data changes: a full re-render for structural edits, or
-  // a dirty-rect region update for paint strokes (cf. desktop dirty_region_).
   const sceneRef = useRef<HTMLCanvasElement>(document.createElement("canvas"));
   const sceneScaleRef = useRef(sceneScaleFor(map));
   const sceneFullDirtyRef = useRef(true);
@@ -204,11 +206,12 @@ export function CanvasView({
   marqueeArmedRef.current = marqueeArmed;
   const createArmedRef = useRef(createArmed);
   createArmedRef.current = createArmed;
-  // real-tile render context (null = abstract overlay only); read by scheduleDraw
   const rctxRef = useRef<RenderCtx | null>(null);
   rctxRef.current = pack && bindings ? { pack, bindings, renderMode } : null;
+  const playerPosRef = useRef(playerPos);
+  playerPosRef.current = playerPos;
 
-  const [hover, setHover] = useState<{ tx: number; ty: number; role: string; type: string } | null>(null);
+  const [hover, setHover] = useState<{ tx: number; ty: number; role: string; type: string; stack: TileStackItem[] } | null>(null);
   const [selBox, setSelBox] = useState<SelBox | null>(null);
 
   const primarySel = useCallback((): LiteObject | null => {
@@ -234,7 +237,9 @@ export function CanvasView({
         sceneRectDirtyRef.current = null;
       }
       const ht = hoverTileRef.current;
+      const activeTool = brushRef.current.tool ?? "brush";
       const showBrush = brushRef.current.ready && !marqueeArmedRef.current && ht
+        && (activeTool === "brush" || activeTool === "eraser")
         && gestureRef.current?.mode !== "move" && gestureRef.current?.mode !== "resize";
       drawMap(ctx, map, sceneRef.current, viewRef.current, w, h, dpr, {
         hoverTile: ht,
@@ -245,6 +250,30 @@ export function CanvasView({
           ? { tx: ht[0], ty: ht[1], size: brushRef.current.size, rgb: brushRef.current.rgb, erase: brushRef.current.erase }
           : null,
       });
+      if (playerPosRef.current) {
+        const [px, py] = playerPosRef.current;
+        const [scX, scY] = tileToScreen(viewRef.current, px, py);
+        // Game View Camera Frame (synced with pitch -14°, FOV 30.5°, 16:9 benchmark)
+        const [camX0, camY0] = tileToScreen(viewRef.current, px - 12.0, py - 4.0 - 7.5);
+        const [camX1, camY1] = tileToScreen(viewRef.current, px + 12.0, py - 4.0 + 7.5);
+        ctx.save();
+        ctx.scale(dpr, dpr);
+        // Game View Camera Frame
+        ctx.strokeStyle = "rgba(56, 189, 248, 0.85)";
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([5, 4]);
+        ctx.strokeRect(camX0, camY0, camX1 - camX0, camY1 - camY0);
+        ctx.setLineDash([]);
+        // Player Pin
+        ctx.fillStyle = "rgba(14, 165, 233, 0.92)";
+        ctx.beginPath();
+        ctx.arc(scX, scY, 6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.restore();
+      }
       let box: SelBox | null = null;
       if (selected.size > 0) {
         const o = findObject(map, [...selected][0]);
@@ -286,7 +315,6 @@ export function CanvasView({
   }, [map]);
 
   useEffect(() => { hitRef.current = buildHitGrid(map, rctxRef.current); sceneFullDirtyRef.current = true; scheduleDraw(); /* eslint-disable-line */ }, [version]);
-  // pack loaded / bindings recompiled / render-mode toggled → rescale + full re-render
   useEffect(() => {
     hitRef.current = buildHitGrid(map, rctxRef.current);
     sceneScaleRef.current = pack ? sceneScaleForPack(map, pack.tileResolution) : sceneScaleFor(map);
@@ -294,11 +322,11 @@ export function CanvasView({
     scheduleDraw();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [packVersion]);
-  useEffect(() => { scheduleDraw(); }, [selected, scheduleDraw]);
+  useEffect(() => { scheduleDraw(); }, [selected, playerPos, scheduleDraw]);
   useEffect(() => {
     if (!canvasRef.current) return;
-    canvasRef.current.style.cursor = marqueeArmed || createArmed ? "crosshair" : "default";
-  }, [marqueeArmed, createArmed]);
+    canvasRef.current.style.cursor = marqueeArmed || createArmed || brush.ready ? "crosshair" : "default";
+  }, [marqueeArmed, createArmed, brush.ready]);
 
   useEffect(() => {
     resize();
@@ -317,16 +345,19 @@ export function CanvasView({
     scheduleDraw();
   }, [scheduleDraw]);
 
-  // Cursor hint based on the selected object under the pointer (no active gesture).
   const updateCursor = useCallback((sx: number, sy: number) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     if (gestureRef.current) return;
-    if (marqueeArmedRef.current || createArmedRef.current) { canvas.style.cursor = "crosshair"; return; }
+    if (marqueeArmedRef.current || createArmedRef.current || brushRef.current.ready) {
+      canvas.style.cursor = "crosshair";
+      return;
+    }
     const sel = primarySel();
     let cur = "default";
-    if (sel && brushRef.current.ready && !isLocked(sel)) cur = "crosshair";
-    else if (sel && (sel.type === "FIXED_RECT" || sel.type === "HOUSE") && !isLocked(sel)) cur = cursorFor(edgeGrab(viewRef.current, sel.rect, sx, sy));
+    if (sel && (sel.type === "FIXED_RECT" || sel.type === "HOUSE") && !isLocked(sel)) {
+      cur = cursorFor(edgeGrab(viewRef.current, sel.rect, sx, sy));
+    }
     canvas.style.cursor = cur;
   }, [primarySel]);
 
@@ -337,10 +368,11 @@ export function CanvasView({
     if (!prev || prev[0] !== tx || prev[1] !== ty) {
       hoverTileRef.current = [tx, ty];
       const o = objectAt(hitRef.current, tx, ty);
-      setHover({ tx, ty, role: o ? roleOf(o) : "", type: o?.type ?? "" });
+      const stack = inspectTileStack(map, tx, ty);
+      setHover({ tx, ty, role: o ? roleOf(o) : "", type: o?.type ?? "", stack });
       scheduleDraw();
     }
-  }, [scheduleDraw]);
+  }, [map, scheduleDraw]);
 
   const onPointerDown = useCallback((e: React.PointerEvent) => {
     try { (e.target as Element).setPointerCapture(e.pointerId); } catch { /* no active pointer */ }
@@ -358,10 +390,9 @@ export function CanvasView({
       e.preventDefault();
       const hit = objectAt(hitRef.current, tx, ty);
       if (ctrl) { onPick(hit ? hit.id : null, true); gestureRef.current = null; return; }
-      if (!hit) { gestureRef.current = null; return; } // RMB empty = no-op (pan is MMB)
+      if (!hit) { gestureRef.current = null; return; }
       const sel = selectedRef.current;
       if (sel.has(hit.id) && sel.size >= 2) {
-        // group move; a no-drag release reduces the selection to this member
         const ids = [...sel];
         const startRects = ids
           .map((id) => { const o = findObject(map, id); return o ? ([...o.rect] as Rect) : null; })
@@ -371,13 +402,26 @@ export function CanvasView({
         gestureRef.current = g;
         return;
       }
-      onPick(hit.id, false); // replace with single (switches layer + sets anchor)
+      onPick(hit.id, false);
       if (!isLocked(hit)) { g.mode = "move"; g.id = hit.id; g.startRect = hit.rect; ghostRef.current = [hit.rect]; }
       gestureRef.current = g.mode === "move" ? g : null;
       return;
     }
 
-    // LMB: armed Marquee tool box-selects; otherwise acts on the selected object
+    // LMB: Shift+Click = Place Player Here
+    if (e.shiftKey && onPlacePlayer) {
+      if (tx >= 0 && ty >= 0 && tx < map.width && ty < map.height) onPlacePlayer(tx, ty);
+      gestureRef.current = null;
+      return;
+    }
+
+    // LMB: Alt+Click = Eyedropper
+    if (e.altKey && onEyedropper) {
+      if (tx >= 0 && ty >= 0 && tx < map.width && ty < map.height) onEyedropper(tx, ty);
+      gestureRef.current = null;
+      return;
+    }
+
     if (createArmedRef.current) {
       if (tx >= 0 && ty >= 0 && tx < map.width && ty < map.height) onCreateAt(tx, ty);
       gestureRef.current = null;
@@ -391,10 +435,11 @@ export function CanvasView({
       scheduleDraw();
       return;
     }
+
     const sel = primarySel();
-    if (!sel || isLocked(sel)) { gestureRef.current = null; return; }
-    // house decoration drag takes priority over house move/resize when a deco is clicked
-    if (sel.type === "HOUSE" && sel.house && bindings) {
+    // House decoration drag or edge resize on a selected HOUSE/FIXED_RECT takes priority if clicked directly on deco/edge
+    if (sel && !isLocked(sel)) {
+      if (sel.type === "HOUSE" && sel.house && bindings) {
         const hb = bindings.get(sel.id);
         if (hb && hb.kind === "house") {
           const slot = decorationAt(sel.house, sel.rect, hb.deco, tx, ty);
@@ -403,16 +448,60 @@ export function CanvasView({
             g.mode = "deco"; g.id = sel.id; g.decoSlot = slot;
             g.grabOffset = [tx - sel.rect[0] - cx, ty - sel.rect[1] - cy];
             onHouseDecoStart(sel.id, slot);
+            gestureRef.current = g;
+            return;
+          }
+        }
+      }
+      if (sel.type === "FIXED_RECT" || sel.type === "HOUSE") {
+        const grab = edgeGrab(viewRef.current, sel.rect, sx, sy);
+        if (grab !== "outside" && grab !== "inside") {
+          g.id = sel.id; g.startRect = sel.rect; ghostRef.current = [sel.rect];
+          g.mode = "resize";
+          g.edges = grab;
           gestureRef.current = g;
           return;
         }
       }
     }
-    if (isTerrain(sel)) {
+
+    // Fast Brush Tools!
+    const tool = brushRef.current.tool ?? "brush";
+    if (tool === "eyedropper" && onEyedropper) {
+      if (tx >= 0 && ty >= 0 && tx < map.width && ty < map.height) onEyedropper(tx, ty);
+      gestureRef.current = null;
+      return;
+    }
+    if (tool === "bucket" && onBucketFill) {
+      if (tx >= 0 && ty >= 0 && tx < map.width && ty < map.height) onBucketFill(tx, ty);
+      gestureRef.current = null;
+      return;
+    }
+    if (tool === "rect" && onRectFill) {
+      if (tx >= 0 && ty >= 0 && tx < map.width && ty < map.height) {
+        g.mode = "rect_brush";
+        g.startTx = tx;
+        g.startTy = ty;
+        ghostRef.current = [[tx, ty, 1, 1]];
+        gestureRef.current = g;
+        scheduleDraw();
+      }
+      return;
+    }
+    if (brushRef.current.ready && (tool === "brush" || tool === "eraser")) {
       g.mode = "paint"; g.lastTx = tx; g.lastTy = ty;
       gestureRef.current = g;
       onStrokeStart(tx, ty);
       sceneRectDirtyRef.current = mergeRect(sceneRectDirtyRef.current, brushTileRect(tx, ty, brushRef.current.size, map.width, map.height));
+      scheduleDraw();
+      return;
+    }
+
+    // Fallback when in "select" tool mode
+    if (!sel || isLocked(sel)) {
+      g.mode = "marquee"; g.additive = ctrl; g.downSx = sx; g.downSy = sy; g.startTx = tx; g.startTy = ty;
+      marqueeBoxRef.current = { x: sx, y: sy, w: 0, h: 0 };
+      gestureRef.current = g;
       scheduleDraw();
       return;
     }
@@ -425,10 +514,9 @@ export function CanvasView({
       gestureRef.current = g;
       return;
     }
-    // FRG / DUNGEON: interior move
     g.mode = "move"; g.id = sel.id; g.startRect = sel.rect; ghostRef.current = [sel.rect];
     gestureRef.current = g;
-  }, [map, onCreateAt, onPick, onStrokeStart, primarySel, scheduleDraw, bindings, onHouseDecoStart]);
+  }, [map, onCreateAt, onPick, onStrokeStart, onRectFill, onBucketFill, onEyedropper, onPlacePlayer, primarySel, scheduleDraw, bindings, onHouseDecoStart]);
 
   const onPointerMove = useCallback((e: React.PointerEvent) => {
     const rect = canvasRef.current!.getBoundingClientRect();
@@ -440,10 +528,28 @@ export function CanvasView({
         const tx = Math.floor((sx - viewRef.current.offX) / viewRef.current.scale);
         const ty = Math.floor((sy - viewRef.current.offY) / viewRef.current.scale);
         if (tx !== g.lastTx || ty !== g.lastTy) {
+          // Bresenham continuous stroke interpolation!
+          const points = bresenhamLine(g.lastTx ?? tx, g.lastTy ?? ty, tx, ty);
+          for (let i = 1; i < points.length; i++) {
+            const [px, py] = points[i];
+            onStrokePaint(px, py);
+            sceneRectDirtyRef.current = mergeRect(
+              sceneRectDirtyRef.current,
+              brushTileRect(px, py, brushRef.current.size, map.width, map.height),
+            );
+          }
           g.lastTx = tx; g.lastTy = ty;
-          onStrokePaint(tx, ty);
-          sceneRectDirtyRef.current = mergeRect(sceneRectDirtyRef.current, brushTileRect(tx, ty, brushRef.current.size, map.width, map.height));
         }
+        scheduleDraw();
+      } else if (g.mode === "rect_brush" && g.startTx != null && g.startTy != null) {
+        const [fx, fy] = screenToTile(viewRef.current, sx, sy);
+        const curTx = Math.max(0, Math.min(map.width - 1, Math.floor(fx)));
+        const curTy = Math.max(0, Math.min(map.height - 1, Math.floor(fy)));
+        const loX = Math.min(g.startTx, curTx);
+        const loY = Math.min(g.startTy, curTy);
+        const hiX = Math.max(g.startTx, curTx);
+        const hiY = Math.max(g.startTy, curTy);
+        ghostRef.current = [[loX, loY, hiX - loX + 1, hiY - loY + 1]];
         scheduleDraw();
       } else if (g.mode === "deco" && g.id != null && g.decoSlot != null && g.grabOffset) {
         const o = findObject(map, g.id);
@@ -498,6 +604,15 @@ export function CanvasView({
     gestureRef.current = null;
     if (!g) return;
     if (g.mode === "paint") { onStrokeEnd(); return; }
+    if (g.mode === "rect_brush") {
+      const box = ghostRef.current?.[0];
+      ghostRef.current = null;
+      if (box && onRectFill) {
+        onRectFill(box[0], box[1], box[0] + box[2] - 1, box[1] + box[3] - 1);
+      }
+      scheduleDraw();
+      return;
+    }
     if (g.mode === "deco") { onHouseDecoEnd(); return; }
     if (g.mode === "marquee") {
       marqueeBoxRef.current = null;
@@ -523,7 +638,7 @@ export function CanvasView({
         const [cdx, cdy] = clampGroupDelta(g.startRects, ghost[0][0] - g.startRects[0][0], ghost[0][1] - g.startRects[0][1], map.width, map.height);
         if (cdx !== 0 || cdy !== 0) onMoveGroup(g.ids, cdx, cdy);
       } else if (!g.moved && g.id != null) {
-        onPick(g.id, false); // no drag → reduce to the clicked member
+        onPick(g.id, false);
       }
       scheduleDraw();
       return;
@@ -541,7 +656,7 @@ export function CanvasView({
       }
       scheduleDraw();
     }
-  }, [map.width, map.height, onMove, onMoveGroup, onResize, onStrokeEnd, onHouseDecoEnd, onMarquee, onMarqueeDone, onPick, scheduleDraw]);
+  }, [map.width, map.height, onMove, onMoveGroup, onResize, onStrokeEnd, onRectFill, onHouseDecoEnd, onMarquee, onMarqueeDone, onPick, scheduleDraw]);
 
   const onPointerLeave = useCallback(() => { hoverTileRef.current = null; setHover(null); scheduleDraw(); }, [scheduleDraw]);
   const resetView = useCallback(() => {
@@ -573,7 +688,7 @@ export function CanvasView({
           {roleOf(selObj) && <code className="ot-role">{roleOf(selObj)}</code>}
           {selected.size > 1 && <span className="ot-count">{selected.size} selected</span>}
           <button onClick={onCopySelection}>Copy</button>
-          <button disabled={!canPasteClipboard} onClick={onPasteClipboard}>Paste</button>
+          <button disabled={!canPasteClipboard} onClick={() => typeof onPasteClipboard === "function" && onPasteClipboard()}>Paste</button>
           <button onClick={onDeleteSelection} className="danger">Delete</button>
           <button onClick={onToggleLock} className={locked ? "active" : ""}>
             {locked ? "🔒 Unlock" : "🔓 Lock"}
@@ -589,8 +704,19 @@ export function CanvasView({
         {hover && (
           <span className="hover">
             ({hover.tx}, {hover.ty})
-            {hover.role && <> · role <code>{hover.role}</code></>}
-            {hover.type && <> · {hover.type.replace(/_/g, " ").toLowerCase()}</>}
+            {hover.stack.length > 0 ? (
+              <>
+                {" · "}
+                <span>叠加({hover.stack.length}): </span>
+                {hover.stack.map((s, i) => (
+                  <code key={s.objectId} style={{ marginRight: 4 }}>
+                    {i + 1}.{s.role}
+                  </code>
+                ))}
+              </>
+            ) : (
+              hover.role && <> · role <code>{hover.role}</code></>
+            )}
           </span>
         )}
       </div>

@@ -809,3 +809,710 @@ button.danger:hover {
 /* house inspector */
 .prop-num { width: 56px; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; font: inherit; }
 .prop-hint { color: var(--muted); font-size: 11px; font-style: italic; margin: 4px 0 2px; }
+
+/* --- 7-Layer Role Tree & Fast Brush Sidebar --- */
+.role-tree-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  overflow: hidden;
+}
+
+.fast-brush-dock {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: none;
+}
+
+.fb-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.fb-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: 0.02em;
+}
+.fb-badge {
+  font-size: 10px;
+  color: #a9c7ff;
+  background: rgba(106, 160, 255, 0.14);
+  border: 1px solid rgba(106, 160, 255, 0.35);
+  border-radius: 99px;
+  padding: 1px 7px;
+}
+
+.fb-tools {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 4px;
+}
+.fb-tool-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 2px;
+  background: #171a21;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.fb-tool-btn.active {
+  background: #2b3a55;
+  border-color: var(--accent);
+  color: #fff;
+}
+.fb-tool-icon { font-size: 13px; line-height: 1.1; }
+.fb-tool-label { font-size: 10px; line-height: 1.1; }
+
+.fb-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.fb-label {
+  font-size: 11px;
+  color: var(--muted);
+  min-width: 28px;
+}
+
+.fb-active-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: #15181f;
+  border: 1px solid var(--border);
+  font-size: 11px;
+}
+.fb-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: none;
+}
+.fb-role-code {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #cfe0ff;
+}
+.fb-type-tag {
+  font-size: 10px;
+  color: var(--muted);
+  background: var(--panel-2);
+  padding: 1px 5px;
+  border-radius: 4px;
+  flex: none;
+}
+
+.role-tree-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-right: 2px;
+}
+
+.cat-tree-card {
+  background: #181c23;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  flex: none;
+}
+.cat-tree-card.active {
+  border-color: rgba(106, 160, 255, 0.65);
+}
+
+.cat-tree-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  background: var(--panel-2);
+  cursor: pointer;
+  user-select: none;
+}
+.cat-tree-header:hover {
+  background: #2c3340;
+}
+.cat-caret {
+  border: none;
+  background: none;
+  padding: 0;
+  width: 12px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.cat-swatch {
+  width: 11px;
+  height: 11px;
+  border-radius: 3px;
+  flex: none;
+}
+.cat-title-wrap {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.cat-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cat-sub {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.stratum-pill {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 99px;
+  flex: none;
+}
+.stratum-pill.ground {
+  background: rgba(88, 178, 118, 0.16);
+  color: #9be4b4;
+  border: 1px solid rgba(88, 178, 118, 0.35);
+}
+.stratum-pill.vertical {
+  background: rgba(235, 168, 76, 0.16);
+  color: #ffd494;
+  border: 1px solid rgba(235, 168, 76, 0.35);
+}
+
+.cat-tree-body {
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.role-node-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.role-node-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.role-node-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  background: #1d222b;
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+.role-node-btn:hover {
+  background: #262d39;
+  border-color: var(--border);
+}
+.role-node-btn.selected {
+  background: #283650;
+  border-color: var(--accent);
+}
+.rn-swatch {
+  width: 28px;
+  height: 28px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: #12151a;
+  display: grid;
+  place-items: center;
+  flex: none;
+}
+.rn-color-fallback {
+  width: 20px;
+  height: 20px;
+  border-radius: 3px;
+}
+.rn-meta {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.rn-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rn-path {
+  font-size: 10px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rn-variants-btn {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 99px;
+}
+
+.role-variants-drawer {
+  background: #13171d;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px;
+}
+.rv-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--muted);
+  margin-bottom: 5px;
+}
+.rv-auto-btn {
+  font-size: 10px;
+  padding: 1px 6px;
+}
+.rv-swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.rv-swatch-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  background: #1b2028;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+.rv-swatch-btn.active {
+  border-color: var(--accent);
+  background: #2a3954;
+}
+.rv-style {
+  font-size: 9px;
+  color: var(--muted);
+  max-width: 42px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cat-objects-section {
+  border-top: 1px dashed var(--border);
+  padding-top: 4px;
+}
+.cat-objects-toggle {
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 2px 4px;
+}
+.cat-objects-toggle:hover {
+  color: var(--text);
+  border: none;
+}
+.cat-objects-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 3px;
+}
+.cat-obj-row {
+  padding-left: 10px;
+}
+.obj-role-tag {
+  font-size: 10px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.05);
+  padding: 0 5px;
+  border-radius: 3px;
+}
+
+.layers-footer-bar {
+  display: flex;
+  gap: 6px;
+  flex: none;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+.layers-footer-bar button {
+  flex: 1;
+  font-size: 11px;
+  padding: 4px 6px;
+}
+
+/* --- Center Viewport Stage (TileMap + Scene View + Game View) --- */
+.viewport-stage {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  overflow: hidden;
+  background: #181c22;
+}
+.canvas-panel-wrap {
+  position: relative;
+  min-width: 0;
+  height: 100%;
+  overflow: hidden;
+}
+.canvas-panel-wrap > .canvas-wrap {
+  width: 100%;
+  height: 100%;
+}
+
+.hd2d-stack-column {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.hd2d-panel-wrap {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+}
+.hd2d-panel-wrap > .hd2d-wrap {
+  width: 100%;
+  height: 100%;
+}
+
+/* --- 视口分割线规范 (统一大尺寸与抓手手感) --- */
+.view-resizer {
+  position: relative;
+  z-index: 20;
+  user-select: none;
+  background: #191d24;
+  flex: none;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+/* 左右视口分割线 (Vertical Splitter Bar, 与 Tilemap View 相邻) */
+.view-resizer-col {
+  width: 8px;
+  cursor: col-resize;
+  border-left: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+}
+
+/* 上下视口分割线 (Horizontal Splitter Bar, Scene 与 Game 之间) */
+.view-resizer-row {
+  height: 8px;
+  cursor: row-resize;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+/* 扩展点击感应范围 (hit area)，随手即可轻松抓取 */
+.view-resizer-col::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -4px;
+  right: -4px;
+  cursor: col-resize;
+}
+.view-resizer-row::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -4px;
+  bottom: -4px;
+  cursor: row-resize;
+}
+
+/* 视觉小抓手 (左右为垂直胶囊，上下为水平胶囊) */
+.view-resizer-col::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 3px;
+  height: 38px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.45);
+  box-shadow: 0 0 2px rgba(0, 0, 0, 0.5);
+  transition: background-color 0.15s ease, transform 0.15s ease;
+}
+
+.view-resizer-row::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 38px;
+  height: 3px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.45);
+  box-shadow: 0 0 2px rgba(0, 0, 0, 0.5);
+  transition: background-color 0.15s ease, transform 0.15s ease;
+}
+
+/* 悬浮与激活高亮 (亮蓝醒目) */
+.view-resizer:hover,
+.view-resizer:active,
+.is-resizing-views .view-resizer-col,
+.is-resizing-views .view-resizer-row {
+  background: var(--accent);
+  border-color: #8bb6ff;
+}
+
+.view-resizer:hover::after,
+.view-resizer:active::after,
+.is-resizing-views .view-resizer-col::after,
+.is-resizing-views .view-resizer-row::after {
+  background: #ffffff;
+  box-shadow: 0 0 6px rgba(255, 255, 255, 0.9);
+}
+
+/* 拖拽分割线时屏蔽子元素鼠标捕获，保证丝滑流畅 */
+.viewport-stage.is-resizing-views * {
+  pointer-events: none !important;
+  user-select: none !important;
+}
+.viewport-stage.is-resizing-views .view-resizer-col,
+.viewport-stage.is-resizing-views .view-resizer-row {
+  pointer-events: auto !important;
+}
+
+.view-role-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 99px;
+  letter-spacing: 0.02em;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+.view-role-pill.scene {
+  background: rgba(35, 52, 88, 0.94);
+  border: 1px solid #6aa0ff;
+  color: #dbe9ff;
+}
+.view-role-pill.game {
+  background: rgba(22, 62, 44, 0.94);
+  border: 1px solid #38d996;
+  color: #d2ffeb;
+}
+
+.create-armed-banner {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 25;
+  background: rgba(32, 48, 78, 0.94);
+  border: 1px solid var(--accent);
+  color: #fff;
+  padding: 5px 12px;
+  border-radius: 99px;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+/* --- 3D HD-2D Viewport --- */
+.hd2d-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  background: #171b22;
+}
+.hd2d-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+}
+.hd2d-hud-top {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  right: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  pointer-events: none;
+}
+.hd2d-hud-top > * {
+  pointer-events: auto;
+}
+.hd2d-stack-slider {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(20, 23, 28, 0.88);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 8px;
+  font-size: 11px;
+  color: var(--text);
+}
+.hd2d-stack-slider input[type="range"] {
+  width: 78px;
+}
+
+.hd2d-walk-banner {
+  position: absolute;
+  top: 48px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(26, 44, 34, 0.92);
+  border: 1px solid #48a868;
+  color: #d4ffe0;
+  padding: 5px 14px;
+  border-radius: 99px;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.hd2d-status {
+  right: 10px;
+  flex-wrap: wrap;
+}
+.status-stack {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.stack-chip {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+}
+.stack-chip.ground {
+  border-color: rgba(88, 178, 118, 0.45);
+  color: #b7f0c9;
+}
+.stack-chip.vertical {
+  border-color: rgba(235, 168, 76, 0.55);
+  color: #ffdfa8;
+}
+
+/* --- Map Lifecycle Modals (New Map & Resize Map) --- */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(10, 12, 16, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.modal-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+  width: min(480px, 100%);
+  overflow: hidden;
+}
+.modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.modal-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+.modal-subtitle {
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.lifecycle-form {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.lf-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12px;
+}
+.lf-field input,
+.lf-field select {
+  background: #151920;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 6px 8px;
+  font: inherit;
+}
+.lf-row-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.lf-presets {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.anchor-grid-9 {
+  display: grid;
+  grid-template-columns: repeat(3, 36px);
+  gap: 5px;
+}
+.anchor-cell {
+  height: 32px;
+  padding: 0;
+  font-size: 14px;
+}
+.modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+}

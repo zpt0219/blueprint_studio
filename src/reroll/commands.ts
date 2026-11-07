@@ -451,3 +451,117 @@ export function reorderLayerObjectsCommand(
     undo: () => setLayerObjectOrder(map, layerId, before),
   };
 }
+
+/** Combine multiple commands into a single atomic Undo/Redo step. */
+export function compositeCommand(label: string, commands: Command[]): Command {
+  return {
+    label,
+    do: () => {
+      for (const c of commands) c.do();
+    },
+    undo: () => {
+      for (let i = commands.length - 1; i >= 0; i--) commands[i].undo();
+    },
+  };
+}
+
+function clipAndShiftObject(o: LiteObject, dx: number, dy: number, newW: number, newH: number): LiteObject | null {
+  const next = cloneObjectDeep(o);
+  translateObject(next, dx, dy);
+  if (next.terrain) {
+    const t = next.terrain;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (let r = 0; r < t.h; r++) {
+      for (let c = 0; c < t.w; c++) {
+        if (t.data[r * t.w + c] < 0) continue;
+        const wx = t.ox + c;
+        const wy = t.oy + r;
+        if (wx < 0 || wy < 0 || wx >= newW || wy >= newH) continue;
+        minX = Math.min(minX, wx);
+        minY = Math.min(minY, wy);
+        maxX = Math.max(maxX, wx);
+        maxY = Math.max(maxY, wy);
+      }
+    }
+    if (maxX < minX || maxY < minY) return null;
+    const nw = maxX - minX + 1;
+    const nh = maxY - minY + 1;
+    const data = new Int16Array(nw * nh).fill(-1);
+    for (let r = 0; r < t.h; r++) {
+      for (let c = 0; c < t.w; c++) {
+        const val = t.data[r * t.w + c];
+        if (val < 0) continue;
+        const wx = t.ox + c;
+        const wy = t.oy + r;
+        if (wx < minX || wy < minY || wx > maxX || wy > maxY) continue;
+        data[(wy - minY) * nw + (wx - minX)] = val;
+      }
+    }
+    next.terrain = { ox: minX, oy: minY, w: nw, h: nh, data };
+    next.rect = [minX, minY, nw, nh];
+    return next;
+  }
+  const [rx, ry, rw, rh] = next.rect;
+  if (rx + rw <= 0 || ry + rh <= 0 || rx >= newW || ry >= newH) return null;
+  const x0 = Math.max(0, rx);
+  const y0 = Math.max(0, ry);
+  const x1 = Math.min(newW, rx + rw);
+  const y1 = Math.min(newH, ry + rh);
+  if (x1 <= x0 || y1 <= y0) return null;
+  next.rect = [x0, y0, x1 - x0, y1 - y0];
+  return next;
+}
+
+/**
+ * Resize the canvas to (newWidth, newHeight) with a 9-grid anchor:
+ * anchorX / anchorY in {-1 (start), 0 (center), 1 (end)}.
+ */
+export function resizeMapCommand(
+  map: LiteTileMap,
+  newWidth: number,
+  newHeight: number,
+  anchorX: -1 | 0 | 1 = -1,
+  anchorY: -1 | 0 | 1 = -1,
+): Command {
+  const beforeW = map.width;
+  const beforeH = map.height;
+  const beforeInferred = map.sizeInferred;
+  const beforeLayers = map.layers.map((l) => ({
+    id: l.id,
+    objects: l.objects.map((o) => cloneObjectDeep(o)),
+  }));
+
+  const diffW = newWidth - beforeW;
+  const diffH = newHeight - beforeH;
+  const dx = anchorX === -1 ? 0 : anchorX === 0 ? Math.floor(diffW / 2) : diffW;
+  const dy = anchorY === -1 ? 0 : anchorY === 0 ? Math.floor(diffH / 2) : diffH;
+
+  const afterLayers = map.layers.map((l) => ({
+    id: l.id,
+    objects: l.objects
+      .map((o) => clipAndShiftObject(o, dx, dy, newWidth, newHeight))
+      .filter((o): o is LiteObject => o !== null),
+  }));
+
+  return {
+    label: `Resize map to ${newWidth}×${newHeight}`,
+    do: () => {
+      map.width = newWidth;
+      map.height = newHeight;
+      map.sizeInferred = false;
+      for (const snap of afterLayers) {
+        const layer = findLayer(map, snap.id);
+        if (layer) layer.objects = snap.objects.map((o) => cloneObjectDeep(o));
+      }
+    },
+    undo: () => {
+      map.width = beforeW;
+      map.height = beforeH;
+      map.sizeInferred = beforeInferred;
+      for (const snap of beforeLayers) {
+        const layer = findLayer(map, snap.id);
+        if (layer) layer.objects = snap.objects.map((o) => cloneObjectDeep(o));
+      }
+    },
+  };
+}
