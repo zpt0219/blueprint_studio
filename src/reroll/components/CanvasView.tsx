@@ -658,6 +658,12 @@ export function CanvasView({
     }
   }, [map.width, map.height, onMove, onMoveGroup, onResize, onStrokeEnd, onRectFill, onHouseDecoEnd, onMarquee, onMarqueeDone, onPick, scheduleDraw]);
 
+  const finishInterruptedStroke = useCallback(() => {
+    if (gestureRef.current?.mode !== "paint") return;
+    gestureRef.current = null;
+    onStrokeEnd();
+  }, [onStrokeEnd]);
+
   const onPointerLeave = useCallback(() => { hoverTileRef.current = null; setHover(null); scheduleDraw(); }, [scheduleDraw]);
   const resetView = useCallback(() => {
     const wrap = wrapRef.current;
@@ -678,6 +684,8 @@ export function CanvasView({
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
+        onPointerCancel={finishInterruptedStroke}
+        onLostPointerCapture={finishInterruptedStroke}
         onPointerLeave={onPointerLeave}
       />
       <button className="reset-view" onClick={resetView} title="重置视图(Fit)">⤢ Fit</button>

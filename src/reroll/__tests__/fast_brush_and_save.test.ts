@@ -18,6 +18,10 @@ import {
 } from "../fastBrush";
 import { setTerrainCell } from "../model";
 import { topRoleOrder } from "../roleTree";
+import { compileMap } from "../pack/compile";
+import { PaletteMode, type PackRuntime, type Palette } from "../pack/types";
+import { usedTilesetIds } from "../pack/tilesets";
+import { createObjectForRole } from "../objectFactory";
 
 const SAMPLE_PATH = resolve(__dirname, "../../../public/sample/test_village_strict.blueprint.json");
 
@@ -46,6 +50,28 @@ describe("7-layer role tree + Fast Brush + Save/Load round-trip", () => {
     // Re-exporting the restored map produces an identical WebSaveFile
     const savedAgain = liteToWebSave(restored);
     expect(savedAgain).toEqual(saved);
+  });
+
+  it("preserves v4 map identity, resolution, expected pack, and FRG defaults", () => {
+    const map = createBlankMap("demo_world", 16, 16, null, 32);
+    map.id = "demo-id";
+    const tree = resolveOrCreateBrushTarget(map, "nature_prop/tree", null, "brush", new Set()).object;
+    tree.frg = { placementMode: "free", cells: [{ palette: "tree", weight: 100 }] };
+    setTerrainCell(tree, 5, 5, true);
+    const pack = { id: "retro@1", name: "Retro" };
+
+    const saved = liteToWebSave(map, pack);
+    expect(saved).toMatchObject({ version: 4, id: "demo-id", tileResolution: 32, pack });
+    const restored = webSaveToLite(saved);
+    expect(liteToWebSave(restored, { id: "fallback@1", name: "Fallback" })).toEqual(saved);
+  });
+
+  it.each([1, 2, 3])("upgrades a v%i save without requiring pack metadata", (version) => {
+    const legacy = { ...liteToWebSave(createBlankMap("old", 16, 16, null)), version, tileResolution: 24 };
+    const restored = webSaveToLite(legacy);
+    expect(restored.id).toBeUndefined();
+    expect(restored.pack).toBeUndefined();
+    expect(liteToWebSave(restored)).toEqual({ ...legacy, version: 4 });
   });
 
   it("supports multi-image stacking on the same tile across categories and within categories", () => {
@@ -138,5 +164,47 @@ describe("7-layer role tree + Fast Brush + Save/Load round-trip", () => {
     expect(targetLiteTypeForRole("nature_prop/tree", "stamp")).toBe("FIXED_RECT");
     expect(targetLiteTypeForRole("terrain_decoration/path/bridge/wooden_bridge")).toBe("FIXED_RECT");
     expect(targetLiteTypeForRole("building/house")).toBe("HOUSE");
+  });
+
+  it.each(["terrain_area", "terrain_line"] as const)("aligns a placed %s to the map and paints only the clicked cell", (kind) => {
+    const map = createBlankMap("terrain", 16, 12, null);
+    const placed = createObjectForRole(map, 0, "terrain/grass", kind, 15, 11);
+    map.layers[0].objects.push(placed);
+
+    expect(placed.rect).toEqual([0, 0, 16, 12]);
+    expect(placed.terrain).toMatchObject({ ox: 0, oy: 0, w: 16, h: 12 });
+    expect(liteToWebSave(map).layers[0].objects[0].cells).toEqual([[15, 11]]);
+  });
+
+  it("reopens explicitly painted tileset palettes without remapping legacy or missing materials", () => {
+    const map = createBlankMap("mixed", 16, 12, "terrain/grass");
+    const builtIn: Palette = {
+      hash: "builtin-grass", role: "terrain/grass", style: "", mode: PaletteMode.TWO_CORNER,
+      size: [4, 4], tileResolution: 16, edge: [-1, -1],
+      mapping: { width: 4, height: 4, cells: new Int32Array(32) },
+    };
+    const imported: Palette = {
+      ...builtIn, hash: "tileset:world~png~sidecar:road", tilesetId: "world~png~sidecar",
+      mode: PaletteMode.TWO_EDGE,
+    };
+    const drawn = resolveOrCreateBrushTarget(map, imported.role, imported, "brush", new Set(), false, [7, 4]).object;
+    setTerrainCell(drawn, 7, 4, true);
+    const reopened = webSaveToLite(liteToWebSave(map));
+    const [legacy, painted] = reopened.layers[0].objects;
+    expect(painted.type).toBe("TERRAIN_2_EDGE");
+    expect(painted.rect).toEqual([0, 0, 16, 12]);
+    expect(painted.terrain).toMatchObject({ ox: 0, oy: 0, w: 16, h: 12 });
+    expect(objectCoversTile(painted, 7, 4)).toBe(true);
+    expect(objectCoversTile(painted, 0, 0)).toBe(false);
+    expect([...usedTilesetIds(reopened)]).toEqual([imported.tilesetId]);
+
+    const pack: PackRuntime = {
+      atlas: {} as HTMLCanvasElement, tileResolution: 16,
+      reference: { id: "test", name: "Test" }, palettes: [builtIn, imported],
+    };
+    const bindings = compileMap(reopened, pack);
+    expect(bindings.get(legacy.id)).toMatchObject({ palette: { hash: builtIn.hash } });
+    expect(bindings.get(painted.id)).toMatchObject({ palette: { hash: imported.hash } });
+    expect(compileMap(reopened, { ...pack, palettes: [builtIn] }).has(painted.id)).toBe(false);
   });
 });

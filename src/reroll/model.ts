@@ -112,8 +112,18 @@ export interface Layer {
   objects: LiteObject[];
 }
 
-export interface LiteTileMap {
+export const DEFAULT_TILE_RESOLUTION = 16;
+
+export interface PalettePackRef {
+  id: string;
   name: string;
+}
+
+export interface LiteTileMap {
+  id?: string;
+  name: string;
+  tileResolution: number;
+  pack?: PalettePackRef;
   /** flat layer list; array order = draw order (later index draws on top) */
   layers: Layer[];
   /** the source was a blueprint root → desktop renders the role overlay */
@@ -223,6 +233,13 @@ export function cloneTerrain(t: TerrainMatrix): TerrainMatrix {
   return { ox: t.ox, oy: t.oy, w: t.w, h: t.h, data: new Int16Array(t.data) };
 }
 
+export function createMapAlignedTerrain({ width, height }: LiteTileMap): { rect: Rect; terrain: TerrainMatrix } {
+  return {
+    rect: [0, 0, width, height],
+    terrain: { ox: 0, oy: 0, w: width, h: height, data: new Int16Array(width * height).fill(-1) },
+  };
+}
+
 /**
  * Paint (present=true) or erase (false) one cell of a terrain object's matrix,
  * growing the matrix + rect when painting outside the current bounds. Erasing
@@ -272,6 +289,20 @@ export function translateObject(o: LiteObject, dx: number, dy: number): void {
   if (o.borderPoints) {
     o.borderPoints = o.borderPoints.map(([x, y]) => [x + dx, y + dy] as Vec2);
   }
+}
+
+/** True if a role represents an abstract engine/editor gizmo (spawner, trigger, marker, camera) rather than a physical world object. */
+export function isLogicalRole(role: string): boolean {
+  const r = (role || "").toLowerCase();
+  return (
+    r.startsWith("spawner") ||
+    r.startsWith("trigger") ||
+    r.startsWith("zone") ||
+    r.startsWith("marker") ||
+    r.startsWith("meta") ||
+    r.startsWith("camera") ||
+    r.startsWith("nav")
+  );
 }
 
 export function cloneObjectDeep(o: LiteObject, id = o.id): LiteObject {

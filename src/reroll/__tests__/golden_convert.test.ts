@@ -24,7 +24,7 @@ describe("Golden Convert Pipeline", () => {
 
     const saved = liteToWebSave(normalized);
     expect(saved.format).toBe("adna-web-lite");
-    expect(saved.version).toBe(3);
+    expect(saved.version).toBe(4);
     expect(saved.width).toBe(100);
     expect(saved.height).toBe(80);
     expect(saved.tileResolution).toBe(16);

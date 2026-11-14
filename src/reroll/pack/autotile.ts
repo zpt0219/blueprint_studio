@@ -11,24 +11,7 @@ import type { Rect } from "../model";
 import { mappingCell, PaletteMode, type Palette } from "./types";
 import { blitTile } from "./blit";
 
-// real engine bit values (src/util/misc.cpp)
-const UP = 1, RIGHT = 2, DOWN = 4, LEFT = 8;
-const UP_RIGHT = UP | RIGHT, RIGHT_DOWN = RIGHT | DOWN, LEFT_DOWN = LEFT | DOWN, UP_LEFT = UP | LEFT;
-const C_TR = 1, C_BR = 2, C_BL = 4, C_TL = 8;
-
-// src/core/palette.cpp — MATRIX[j][i] = the neighbor-bit value that grid cell (i,j) serves
-const TWO_EDGE_MATRIX = [
-  [4, 6, 14, 12],
-  [5, 7, 15, 13],
-  [1, 3, 11, 9],
-  [0, 2, 10, 8],
-];
-const TWO_CORNER_MATRIX = [
-  [4, 3, 14, 6],
-  [10, 7, 15, 13],
-  [1, 9, 11, 12],
-  [0, 2, 5, 8],
-];
+import { cornerMask, edgeMask, TWO_CORNER_MATRIX, TWO_EDGE_MATRIX } from "../../shared/tileNeighbors";
 
 /** present iff in-bounds and the cell value ≥ 0 (0=present, -1=empty).
  *  When `borderAsConnected`, out-of-bounds counts as filled. Local matrix coords. */
@@ -38,26 +21,11 @@ function present(t: TerrainMatrix, c: number, r: number, borderAsConnected: bool
 }
 
 function bitsTwoEdge(t: TerrainMatrix, c: number, r: number, borderAsConnected: boolean): number {
-  let b = 0;
-  if (present(t, c, r - 1, borderAsConnected)) b |= UP;
-  if (present(t, c + 1, r, borderAsConnected)) b |= RIGHT;
-  if (present(t, c, r + 1, borderAsConnected)) b |= DOWN;
-  if (present(t, c - 1, r, borderAsConnected)) b |= LEFT;
-  return b;
+  return edgeMask((x, y) => present(t, x, y, borderAsConnected), c, r);
 }
 
 function bitsTwoCorner(t: TerrainMatrix, c: number, r: number, borderAsConnected: boolean): number {
-  let mask = 0;
-  if (present(t, c, r - 1, borderAsConnected)) mask |= UP;
-  if (present(t, c + 1, r, borderAsConnected)) mask |= RIGHT;
-  if (present(t, c, r + 1, borderAsConnected)) mask |= DOWN;
-  if (present(t, c - 1, r, borderAsConnected)) mask |= LEFT;
-  let bits = 0;
-  if ((mask & UP_RIGHT) === UP_RIGHT && present(t, c + 1, r - 1, borderAsConnected)) bits |= C_TR;
-  if ((mask & RIGHT_DOWN) === RIGHT_DOWN && present(t, c + 1, r + 1, borderAsConnected)) bits |= C_BR;
-  if ((mask & LEFT_DOWN) === LEFT_DOWN && present(t, c - 1, r + 1, borderAsConnected)) bits |= C_BL;
-  if ((mask & UP_LEFT) === UP_LEFT && present(t, c - 1, r - 1, borderAsConnected)) bits |= C_TL;
-  return bits;
+  return cornerMask((x, y) => present(t, x, y, borderAsConnected), c, r);
 }
 
 export function terrainNeighborBits(type: LiteType, t: TerrainMatrix, c: number, r: number, borderAsConnected = false): number {

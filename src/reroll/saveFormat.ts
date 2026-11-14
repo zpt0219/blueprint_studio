@@ -4,12 +4,12 @@
 // mapping. Readable + web-natural: string type names, [x,y,w,h] rects, terrain
 // as an absolute cell list, tags verbatim — no base64/Recti/enum-ints here.
 
-import type { LiteObject, LiteTileMap, Layer } from "./model";
+import type { LiteObject, LiteTileMap, Layer, PalettePackRef } from "./model";
 import type { Vec2 } from "./types";
 import { DEFAULT_FRG_NOISE_CONFIG, noiseConfigFromTags } from "./terrainNoise";
 
 export const WEB_SAVE_FORMAT = "adna-web-lite";
-export const WEB_SAVE_VERSION = 3;
+export const WEB_SAVE_VERSION = 4;
 
 export interface WebSaveHouse {
   wallHeight: number;
@@ -40,10 +40,12 @@ export interface WebSaveLayer {
 export interface WebSaveFile {
   format: typeof WEB_SAVE_FORMAT;
   version: number;
+  id?: string;
   name: string;
   width: number;
   height: number;
   tileResolution: number;
+  pack?: PalettePackRef;
   layers: WebSaveLayer[];
 }
 
@@ -114,14 +116,17 @@ function layerJson(layer: Layer, isBlueprint: boolean): WebSaveLayer {
 }
 
 /** Serialize a lite TileMap into the `adna-web-lite` save object. */
-export function liteToWebSave(map: LiteTileMap): WebSaveFile {
+export function liteToWebSave(map: LiteTileMap, activePack?: PalettePackRef): WebSaveFile {
+  const pack = map.pack ?? activePack;
   return {
     format: WEB_SAVE_FORMAT,
     version: WEB_SAVE_VERSION,
+    ...(map.id ? { id: map.id } : {}),
     name: map.name,
     width: map.width,
     height: map.height,
-    tileResolution: 16,
+    tileResolution: map.tileResolution,
+    ...(pack ? { pack: { ...pack } } : {}),
     layers: map.layers.map((l) => layerJson(l, map.isBlueprint)),
   };
 }

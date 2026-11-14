@@ -374,7 +374,7 @@ const sampleMap = {
     {
       name: "spawner",
       enabled: true,
-      tags: { "role.root": "spawner", "role.stratum": "vertical" },
+      tags: { "role.root": "spawner", "role.stratum": "ground" },
       objects: [
         {
           type: "FIXED_RECT",

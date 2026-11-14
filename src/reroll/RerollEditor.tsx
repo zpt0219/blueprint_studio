@@ -1,13 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent } from "react";
 import { parseBlueprint } from "./blueprint";
 import { blueprintToLite } from "./convert";
 import { normalizeToCategories } from "./normalize";
 import { DEFAULT_FRG_PLACEMENT_MODE, assignUniqueObjectNames, cloneObjectDeep, cloneTerrain, displayName, findLayer, findObject, isLocked, layerOfObject, roleOf, setTerrainCell, translateObject, type FrgCellData, type FrgPlacementMode, type HouseDecorationKind, type LiteObject, type LiteTileMap, type Rect } from "./model";
 import { UndoStack, bitwiseObjectCommand, compositeCommand, createObjectCommand, createObjectsCommand, deleteObjectsCommand, moveHouseDecoCommand, moveObjectCommand, moveObjectsCommand, paintTerrainCommand, randomizeTerrainCommand, renameObjectCommand, reorderLayerObjectsCommand, resizeMapCommand, resizeObjectCommand, setFrgCellsCommand, setFrgPlacementModeCommand, setHouseDecoPaletteCommand, setHouseDecorationsCommand, setHouseOverlapCommand, setHouseSlotPaletteCommand, setObjectRectCommand, setObjectsEnabledCommand, setObjectPaletteCommand, setObjectTypeCommand, setWallHeightCommand, terrainMutationWithTagsCommand, toggleLayerEnabledCommand, toggleObjectEnabledCommand, type Command, type LayerObjectSnapshot, type TerrainSnapshot } from "./commands";
 import type { LiteType } from "./model";
-import { liteToWebSave } from "./saveFormat";
+import { liteToWebSave, WEB_SAVE_FORMAT } from "./saveFormat";
 import { createBlankMap, isWebSaveFile, webSaveToLite } from "./loadSave";
-import { clearDraft, loadDraft, saveDraft } from "./draft";
+import { clearDraft, draftKey, getActiveDraftKey, listDrafts, loadDraft, saveDraft, setActiveDraftKey } from "./draft";
+import { contentId, newMapId } from "./contentId";
 import { downloadJson } from "./download";
 import { colorForRole } from "./generated/roleColors";
 import { applyBitwiseObjectOp, dilateTerrainMatrix, erodeTerrainMatrix, fillTerrainMatrix, flipTerrainMatrix, hasBitwiseOverlap, isBitwiseSupported, keepBorderTerrainMatrix, removeZeroLikeDesktop, terrainMatrixEquals, type BitwiseObjectOp } from "./bitwise";
@@ -19,6 +20,7 @@ import { NewMapModal, ResizeMapModal } from "./components/MapLifecycleModals";
 import { PalettePickerModal, type PaletteCreateRequest } from "./components/PalettePickerModal";
 import { PropsPanel } from "./components/PropsPanel";
 import { RoleTreeBrushPanel } from "./components/RoleTreeBrushPanel";
+import { combineTilesets, loadTileset, readTilesetSources, tilesetIdForPalette, tilesetName, usedTilesetIds, writeTilesetSources, type LoadedTileset, type TilesetSource } from "./pack/tilesets";
 import { loadPackFromUrl } from "./pack/loadPack";
 import { compileMap, resolvePaletteForRole } from "./pack/compile";
 import { PaletteMode, type Palette, type PackRuntime } from "./pack/types";
@@ -35,12 +37,22 @@ import {
   inspectTileStack,
   isMatrixBrushType,
   objectCoversTile,
+  objectUsesBrushPalette,
   resolveOrCreateBrushTarget,
+  targetLiteTypeForBrush,
   targetLiteTypeForRole,
   type ActiveBrushConfig,
 } from "./fastBrush";
 
 const borderAsConnected = (o: LiteObject) => o.tags["borderAsConnected"] === "true";
+
+function packForSave(map: LiteTileMap, builtIn: PackRuntime | null) {
+  if (map.pack) return map.pack;
+  const usesBuiltIn = map.layers.some((layer) => layer.objects.some((object) =>
+    !tilesetIdForPalette(object.tags["web.palette"]) &&
+    !object.frg?.cells.some((cell) => tilesetIdForPalette(cell.palette))));
+  return usesBuiltIn ? builtIn?.reference : undefined;
+}
 
 type DropSide = "before" | "after";
 
@@ -198,9 +210,24 @@ export default function App() {
   });
   const [map, setMap] = useState<LiteTileMap | null>(null);
   const [error, setError] = useState("");
+  const [drafts, setDrafts] = useState(listDrafts);
+  const [draftFailed, setDraftFailed] = useState(false);
   const [version, setVersion] = useState(0);
+  const [isPainting, setIsPainting] = useState(false);
   // palette pack + real-tile rendering
-  const [pack, setPack] = useState<PackRuntime | null>(null);
+  const [builtInPack, setBuiltInPack] = useState<PackRuntime | null>(null);
+  const [tilesets, setTilesets] = useState<LoadedTileset[]>([]);
+  const [tilesetsReady, setTilesetsReady] = useState(false);
+  const [tilesetError, setTilesetError] = useState("");
+  const tilesetEdit = useRef(false);
+  const combined = useMemo(() => {
+    try { return { pack: combineTilesets(builtInPack, tilesets), error: "" }; }
+    catch (cause) { return { pack: builtInPack, error: String(cause) }; }
+  }, [builtInPack, tilesets]);
+  const { pack } = combined;
+  const [packError, setPackError] = useState("");
+  const packRef = useRef(builtInPack);
+  packRef.current = builtInPack;
   const [renderMode, setRenderMode] = useState<RenderMode>("mixed");
   const [packVersion, setPackVersion] = useState(0);
   const [viewLayout, setViewLayout] = useState<ViewLayout>("triple");
@@ -255,7 +282,8 @@ export default function App() {
   const decoDrag = useRef<{ id: number; index: number; before: [number, number] } | null>(null);
   const terrainNoisePreview = useRef<{ id: number; before: TerrainSnapshot; beforeTags: Record<string, string> } | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
-  const saveTimer = useRef<number | null>(null);
+  const pendingDraft = useRef<{ map: LiteTileMap; timer: number } | null>(null);
+  const openRequest = useRef(0);
 
   const onChangeBrushConfig = useCallback((patch: Partial<ActiveBrushConfig>) => {
     setBrushConfig((prev) => {
@@ -266,9 +294,39 @@ export default function App() {
     });
   }, []);
 
+  const persistDraft = useCallback((lite: LiteTileMap) => {
+    const saved = saveDraft({ ...lite, pack: packForSave(lite, packRef.current) });
+    setDraftFailed(!saved);
+    if (saved) setDrafts((prev) => [saved, ...prev.filter((draft) => draft.key !== saved.key)]);
+    return saved;
+  }, []);
+
+  const removeDraft = useCallback((key: string) => {
+    clearDraft(key);
+    setDrafts((prev) => prev.filter((draft) => draft.key !== key));
+  }, []);
+
+  const cancelPendingDraft = useCallback(() => {
+    const pending = pendingDraft.current;
+    if (!pending) return null;
+    pendingDraft.current = null;
+    window.clearTimeout(pending.timer);
+    return pending.map;
+  }, []);
+
+  const flushPendingDraft = useCallback(() => {
+    const lite = cancelPendingDraft();
+    if (lite) persistDraft(lite);
+  }, [cancelPendingDraft, persistDraft]);
+
   const applyNewMapState = useCallback((lite: LiteTileMap) => {
+    flushPendingDraft();
+    lite.id ??= newMapId();
+    setActiveDraftKey(draftKey(lite.id));
     assignUniqueObjectNames(lite);
     undo.current = new UndoStack();
+    stroke.current = null;
+    setIsPainting(false);
     setMap(lite);
     setSelected(new Set());
     setAnchorId(null);
@@ -297,7 +355,19 @@ export default function App() {
     terrainNoisePreview.current = null;
     setVersion(0);
     setError("");
-  }, []);
+    setDraftFailed(false);
+  }, [flushPendingDraft]);
+
+  const resumeDraft = useCallback((key: string) => {
+    flushPendingDraft();
+    const draft = loadDraft(key);
+    if (!draft) return false;
+    openRequest.current++;
+    const id = draft.map.id ??= newMapId();
+    applyNewMapState(draft.map);
+    if (draftKey(id) !== key && persistDraft(draft.map)) removeDraft(key);
+    return true;
+  }, [applyNewMapState, flushPendingDraft, persistDraft, removeDraft]);
 
   const onPlacePlayer = useCallback((tx: number, ty: number) => {
     setPlayer((prev) => ({
@@ -311,14 +381,16 @@ export default function App() {
   const build = useCallback((name: string, text: string) => {
     let lite: LiteTileMap;
     const raw = JSON.parse(text);
-    if (isWebSaveFile(raw)) {
+    if (raw?.format === WEB_SAVE_FORMAT) {
+      if (!isWebSaveFile(raw)) throw new Error(`Invalid ${WEB_SAVE_FORMAT} layers`);
       lite = webSaveToLite(raw);
     } else {
       lite = normalizeToCategories(blueprintToLite(parseBlueprint(name, text)));
     }
-    assignUniqueObjectNames(lite);
-    // resume an unfinished local session for this source, if the user wants it
-    const draft = loadDraft(name);
+    lite.id ??= `import:${contentId(new TextEncoder().encode(text))}`;
+    flushPendingDraft();
+    const key = draftKey(lite.id);
+    const draft = loadDraft(key);
     if (draft) {
       const when = new Date(draft.savedAt).toLocaleString();
       const confirmMsg = lang === 'zh'
@@ -327,21 +399,20 @@ export default function App() {
       if (confirm(confirmMsg)) {
         lite = draft.map;
       } else {
-        clearDraft(name);
+        removeDraft(key);
       }
     }
     applyNewMapState(lite);
-  }, [lang, applyNewMapState]);
+  }, [lang, applyNewMapState, flushPendingDraft, removeDraft]);
 
-  const load = useCallback((name: string, text: string) => {
-    build(name, text);
-  }, [build]);
-
-  const onNewMap = useCallback((name: string, width: number, height: number, baseRole: string | null) => {
-    const lite = createBlankMap(name, width, height, baseRole);
+  const onNewMap = useCallback((name: string, width: number, height: number, baseRole: string | null, tileResolution: number) => {
+    openRequest.current++;
+    const lite = createBlankMap(name, width, height, baseRole, tileResolution);
+    if (baseRole) lite.pack = packRef.current?.reference;
     applyNewMapState(lite);
+    persistDraft(lite);
     setNewMapOpen(false);
-  }, [applyNewMapState]);
+  }, [applyNewMapState, persistDraft]);
 
   const toggleExpand = useCallback((id: number) => {
     setExpanded((prev) => {
@@ -353,30 +424,111 @@ export default function App() {
   }, []);
 
   const loadFile = useCallback(async (file: File) => {
-    try { load(file.name, await file.text()); }
-    catch (e) { setError(`加载失败: ${(e as Error).message}`); }
-  }, [load]);
+    const request = ++openRequest.current;
+    try {
+      const source = await file.text();
+      if (request === openRequest.current) build(file.name, source);
+    } catch (e) {
+      if (request === openRequest.current) setError(`加载失败: ${(e as Error).message}`);
+    }
+  }, [build]);
 
   const loadSample = useCallback(async () => {
+    const request = ++openRequest.current;
     try {
       const res = await fetch(`${import.meta.env.BASE_URL}sample/hd2d_test_village_32x32.adnaweb.json`);
       if (!res.ok) throw new Error(`sample 不可用 (${res.status})`);
-      load("hd2d_test_village_32x32 (sample)", await res.text());
-    } catch (e) { setError(`样例加载失败: ${(e as Error).message}`); }
-  }, [load]);
+      const source = await res.text();
+      if (request === openRequest.current) build("hd2d_test_village_32x32 (sample)", source);
+    } catch (e) {
+      if (request === openRequest.current) setError(`样例加载失败: ${(e as Error).message}`);
+    }
+  }, [build]);
 
   // load the palette pack once: prefer the server's live default (kept current by
   // the tagger's "apply roles" button), fall back to the bundled copy (gh-pages/offline).
   useEffect(() => {
     loadPackFromUrl("/api/reroll-pack")
       .catch(() => loadPackFromUrl(`${import.meta.env.BASE_URL}sample/palettes.adnapalettepack`))
-      .then(setPack)
-      .catch((e) => setError(`palette pack 加载失败: ${(e as Error).message}`));
+      .then(setBuiltInPack)
+      .catch((e: Error) => setPackError(e.message));
   }, []);
 
-  // open straight to the rendered sample village (so the live/Pages link shows
-  // tiles immediately); the user can still drop or open their own blueprint
-  useEffect(() => { void loadSample(); /* eslint-disable-line react-hooks/exhaustive-deps */ }, []);
+  useEffect(() => {
+    let cancelled = false;
+    readTilesetSources()
+      .then((sources) => Promise.allSettled(sources.map(loadTileset)))
+      .then((results) => {
+        if (cancelled) {
+          for (const result of results) {
+            if (result.status === "fulfilled" && "close" in result.value.image) result.value.image.close();
+          }
+          return;
+        }
+        setTilesets(results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []));
+        const failures = results.flatMap((result) => result.status === "rejected" ? [String(result.reason)] : []);
+        if (failures.length) setTilesetError(failures.join(" · "));
+      })
+      .catch((cause) => { if (!cancelled) setTilesetError(String(cause)); })
+      .finally(() => { if (!cancelled) setTilesetsReady(true); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const importTilesets = useCallback(async (sources: TilesetSource[]) => {
+    if (tilesetEdit.current) throw new Error("Another tileset change is in progress");
+    tilesetEdit.current = true;
+    const added: LoadedTileset[] = [];
+    try {
+      const ids = new Set(tilesets.map((tileset) => tileset.source.id));
+      for (const source of sources) {
+        if (ids.has(source.id)) continue;
+        added.push(await loadTileset(source));
+        ids.add(source.id);
+      }
+      if (added.length) {
+        const next = [...tilesets, ...added];
+        combineTilesets(packRef.current, next);
+        await writeTilesetSources(added.map((tileset) => tileset.source));
+        setTilesets(next);
+      }
+      setTilesetError("");
+      return sources[0].id;
+    } catch (cause) {
+      for (const { image } of added) if ("close" in image) image.close();
+      throw cause;
+    } finally {
+      tilesetEdit.current = false;
+    }
+  }, [tilesets]);
+
+  const removeTileset = useCallback(async (id: string) => {
+    if (tilesetEdit.current) return;
+    flushPendingDraft();
+    const usesTileset = (lite: LiteTileMap | undefined | null) => lite && usedTilesetIds(lite).has(id);
+    if (usesTileset(map) || listDrafts().some(({ key }) => usesTileset(loadDraft(key)?.map))) {
+      throw new Error(lang === "zh" ? "当前地图或本地草稿仍在使用这张 Tileset。" : "This tileset is still used by the current map or a local draft.");
+    }
+    tilesetEdit.current = true;
+    try {
+      await writeTilesetSources([], id);
+      setTilesets((prev) => prev.filter((tileset) => tileset.source.id !== id));
+    } finally {
+      tilesetEdit.current = false;
+    }
+  }, [map, lang, flushPendingDraft]);
+
+  useEffect(() => {
+    const key = getActiveDraftKey();
+    if (!key || !resumeDraft(key)) void loadSample();
+    // Startup only. File-picker callbacks can change with the UI language.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const refreshDrafts = () => setDrafts(listDrafts());
+    window.addEventListener("storage", refreshDrafts);
+    return () => window.removeEventListener("storage", refreshDrafts);
+  }, []);
 
   // bind a palette to each object by role (also recompiled on edits — type
   // conversion / palette override change the bindings; version bumps on every command)
@@ -495,14 +647,24 @@ export default function App() {
   const resetViewH = useCallback(() => setViewSplitH(0.5), []);
   const resetViewV = useCallback(() => setViewSplitV(0.5), []);
 
-  // autosave the edit session to localStorage (debounced) — only after a real
-  // edit (version>0), so just opening a map doesn't create a phantom "resume?" draft
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!map || version === 0) return;
-    if (saveTimer.current) window.clearTimeout(saveTimer.current);
-    saveTimer.current = window.setTimeout(() => saveDraft(map.name, map), 500);
-    return () => { if (saveTimer.current) window.clearTimeout(saveTimer.current); };
-  }, [map, version]);
+    cancelPendingDraft();
+    pendingDraft.current = { map, timer: window.setTimeout(flushPendingDraft, 500) };
+  }, [map, version, cancelPendingDraft, flushPendingDraft]);
+
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") flushPendingDraft();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("pagehide", flushPendingDraft);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("pagehide", flushPendingDraft);
+      flushPendingDraft();
+    };
+  }, [flushPendingDraft]);
 
   // --- commands ---
   const run = useCallback((cmd: Command) => { undo.current.push(cmd); setVersion((v) => v + 1); }, []);
@@ -518,9 +680,11 @@ export default function App() {
   const onExport = useCallback(() => {
     if (!map) return;
     const base = (map.name || "map").replace(/\s*\(sample\)$/, "").replace(/\.[^.]+$/, "") || "map";
-    downloadJson(`${base}.adnaweb.json`, liteToWebSave(map));
-    clearDraft(map.name); // saved to disk → drop the local resume draft
-  }, [map]);
+    downloadJson(`${base}.adnaweb.json`, liteToWebSave(map, packForSave(map, packRef.current)));
+    cancelPendingDraft();
+    if (map.id) removeDraft(draftKey(map.id));
+    setDraftFailed(false);
+  }, [map, cancelPendingDraft, removeDraft]);
 
   const onMove = useCallback((id: number, before: [number, number], after: [number, number]) => {
     if (map) run(moveObjectCommand(map, id, before, after));
@@ -547,12 +711,11 @@ export default function App() {
     setExpanded((prev) => new Set(prev).add(layerId));
   }, []);
 
-  // Replace selection with a single object (switch active layer, set anchor, sync brush role).
-  const selectSingle = useCallback((id: number) => {
+  const selectSingle = useCallback((id: number, syncBrush = true) => {
     if (!map) return;
     const ly = layerOfObject(map, id);
     if (ly) revealLayer(ly.id);
-    const obj = findObject(map, id);
+    const obj = syncBrush ? findObject(map, id) : null;
     if (obj) {
       const r = roleOf(obj);
       if (r) {
@@ -574,10 +737,14 @@ export default function App() {
     if (brushConfig.paletteHash) {
       const exact = pack.palettes.find((p) => p.hash === brushConfig.paletteHash);
       if (exact) return exact;
+      if (tilesetIdForPalette(brushConfig.paletteHash)) return null;
     }
     const targetType = targetLiteTypeForRole(brushConfig.role, brushConfig.propStyle);
-    return resolvePaletteForRole(pack.palettes, brushConfig.role, "", 1, targetType) ?? null;
-  }, [pack, brushConfig.paletteHash, brushConfig.role, brushConfig.propStyle]);
+    return builtInPack ? resolvePaletteForRole(builtInPack.palettes, brushConfig.role, "", 1, targetType) : null;
+  }, [pack, builtInPack, brushConfig.paletteHash, brushConfig.role, brushConfig.propStyle]);
+  const missingBrush = Boolean(tilesetIdForPalette(brushConfig.paletteHash) && !activeBrushPalette);
+  const rawBrushLayer = activeBrushPalette?.rawTile && map && activeLayerId != null ? findLayer(map, activeLayerId) : null;
+  const brushRole = rawBrushLayer ? `${rawBrushLayer.tags["role.root"] || rawBrushLayer.name}/tiles` : brushConfig.role;
 
   const placeNonMatrixObjectAt = useCallback((tx: number, ty: number, overrideSize?: [number, number]) => {
     if (!map) return;
@@ -585,7 +752,7 @@ export default function App() {
     let maxId = -1;
     for (const l of map.layers) for (const o of l.objects) maxId = Math.max(maxId, o.id);
     const id = maxId + 1;
-    const targetType = targetLiteTypeForRole(brushConfig.role, brushConfig.propStyle);
+    const targetType = targetLiteTypeForBrush(brushConfig.role, brushConfig.propStyle, activeBrushPalette);
     if (targetType === "HOUSE") {
       const wallPal = pack?.palettes.find((p) => p.role === HOUSE_WALL_ROLE && isStructureMode(p.mode)) ?? activeBrushPalette;
       const roofPal = pack?.palettes.find((p) => p.role === HOUSE_ROOF_ROLE && isStructureMode(p.mode)) ?? activeBrushPalette;
@@ -605,7 +772,8 @@ export default function App() {
       }
       return;
     }
-    const size: [number, number] = overrideSize ?? (activeBrushPalette?.size ? [activeBrushPalette.size[0], activeBrushPalette.size[1]] : [2, 2]);
+    const size: [number, number] = (activeBrushPalette?.tilesetId ? activeBrushPalette.size : overrideSize)
+      ?? activeBrushPalette?.size ?? [2, 2];
     const created = createObjectForRole(map, id, brushConfig.role, "fixed_rect", tx, ty, {
       paletteHash: activeBrushPalette?.hash,
       size,
@@ -633,9 +801,10 @@ export default function App() {
           if (setTerrainCell(target, x, y, false)) changed = true;
         }
       } else {
-        const layer = ensureLayerForRole(map, brushConfig.role);
+        const layer = rawBrushLayer ?? ensureLayerForRole(map, brushRole);
         for (const obj of layer.objects) {
           if (!obj.enabled || isLocked(obj) || !obj.terrain || !isMatrixBrushType(obj.type)) continue;
+          if (activeBrushPalette?.tilesetId && !objectUsesBrushPalette(obj, activeBrushPalette.hash)) continue;
           for (const [x, y] of cells) {
             if (!objectCoversTile(obj, x, y)) continue;
             if (!session.beforeMap.has(obj.id)) {
@@ -669,7 +838,7 @@ export default function App() {
     }
     if (changed) session.dirty = true;
     return changed;
-  }, [map, brushConfig.size, brushConfig.shape, brushConfig.role, brushConfig.replaceSameLayer]);
+  }, [map, brushConfig.size, brushConfig.shape, brushRole, rawBrushLayer, brushConfig.replaceSameLayer, activeBrushPalette]);
 
   const commitSessionCommand = useCallback((session: StrokeSession, label: string) => {
     if (!map) return;
@@ -699,9 +868,24 @@ export default function App() {
   }, [map, run]);
 
   const onStrokeStart = useCallback((tx: number, ty: number) => {
-    if (!map) { stroke.current = null; return; }
+    if (!map || missingBrush || tilesetEdit.current) { stroke.current = null; return; }
+    const imported = Boolean(activeBrushPalette?.tilesetId);
+    if (imported && (tx < 0 || ty < 0 || tx >= map.width || ty >= map.height)) return;
+    const targetType = targetLiteTypeForBrush(brushConfig.role, brushConfig.propStyle, activeBrushPalette);
     if (brushConfig.tool === "eraser") {
-      const selFirst = selected.size === 1 ? findObject(map, [...selected][0]) : null;
+      if (imported && !isMatrixBrushType(targetType)) {
+        const hit = inspectTileStack(map, tx, ty).reverse().find((item) => item.paletteHash === activeBrushPalette?.hash && !item.hasMatrix);
+        const layer = hit && findLayer(map, hit.layerId);
+        const index = layer && hit ? layer.objects.findIndex((object) => object.id === hit.objectId) : -1;
+        if (layer && index >= 0 && !isLocked(layer.objects[index])) {
+          const object = layer.objects[index];
+          run(deleteObjectsCommand(map, [{ layerId: layer.id, index, object }]));
+          if (selected.has(object.id)) setSelected(new Set([...selected].filter((id) => id !== object.id)));
+          setAnchorId((id) => id === object.id ? null : id);
+        }
+        return;
+      }
+      const selFirst = !imported && selected.size === 1 ? findObject(map, [...selected][0]) : null;
       const eraseTarget = selFirst && isMatrixBrushType(selFirst.type) && !isLocked(selFirst) && selFirst.terrain
         ? selFirst.id
         : null;
@@ -713,10 +897,10 @@ export default function App() {
       };
       if (applySessionDab(session, tx, ty)) setVersion((v) => v + 1);
       stroke.current = session;
+      setIsPainting(true);
       return;
     }
 
-    const targetType = targetLiteTypeForRole(brushConfig.role, brushConfig.propStyle);
     if (!isMatrixBrushType(targetType)) {
       stroke.current = null;
       placeNonMatrixObjectAt(tx, ty);
@@ -725,10 +909,13 @@ export default function App() {
 
     const resolved = resolveOrCreateBrushTarget(
       map,
-      brushConfig.role,
+      brushRole,
       activeBrushPalette,
       brushConfig.propStyle,
       selected,
+      false,
+      imported ? [tx, ty] : undefined,
+      rawBrushLayer ?? undefined,
     );
     const beforeMap = new Map<number, TerrainSnapshot>();
     if (!resolved.created && resolved.object.terrain) {
@@ -750,7 +937,8 @@ export default function App() {
     setAnchorId(resolved.object.id);
     setVersion((v) => v + 1);
     stroke.current = session;
-  }, [map, brushConfig.tool, brushConfig.role, brushConfig.propStyle, selected, activeBrushPalette, applySessionDab, placeNonMatrixObjectAt, revealLayer]);
+    setIsPainting(true);
+  }, [map, missingBrush, brushConfig.tool, brushConfig.role, brushConfig.propStyle, brushRole, rawBrushLayer, selected, activeBrushPalette, applySessionDab, placeNonMatrixObjectAt, revealLayer, run]);
 
   const onStrokePaint = useCallback((tx: number, ty: number) => {
     const session = stroke.current;
@@ -764,11 +952,12 @@ export default function App() {
     const session = stroke.current;
     stroke.current = null;
     if (!session) return;
+    setIsPainting(false);
     commitSessionCommand(session, session.mode === "erase" ? "Erase tiles" : "Paint tiles");
   }, [commitSessionCommand]);
 
   const onRectFill = useCallback((loX: number, loY: number, hiX: number, hiY: number) => {
-    if (!map) return;
+    if (!map || missingBrush || tilesetEdit.current) return;
     const clampedLoX = Math.max(0, Math.min(map.width - 1, loX));
     const clampedLoY = Math.max(0, Math.min(map.height - 1, loY));
     const clampedHiX = Math.max(0, Math.min(map.width - 1, hiX));
@@ -776,7 +965,7 @@ export default function App() {
     const w = clampedHiX - clampedLoX + 1;
     const h = clampedHiY - clampedLoY + 1;
 
-    const targetType = targetLiteTypeForRole(brushConfig.role, brushConfig.propStyle);
+    const targetType = targetLiteTypeForBrush(brushConfig.role, brushConfig.propStyle, activeBrushPalette);
     if (!isMatrixBrushType(targetType)) {
       placeNonMatrixObjectAt(clampedLoX, clampedLoY, [Math.max(1, w), Math.max(1, h)]);
       return;
@@ -784,10 +973,13 @@ export default function App() {
 
     const resolved = resolveOrCreateBrushTarget(
       map,
-      brushConfig.role,
+      brushRole,
       activeBrushPalette,
       brushConfig.propStyle,
       selected,
+      false,
+      activeBrushPalette?.tilesetId ? [clampedLoX, clampedLoY] : undefined,
+      rawBrushLayer ?? undefined,
     );
     const beforeMap = new Map<number, TerrainSnapshot>();
     if (!resolved.created && resolved.object.terrain) {
@@ -822,21 +1014,24 @@ export default function App() {
     setSelected(new Set([resolved.object.id]));
     setAnchorId(resolved.object.id);
     commitSessionCommand(session, "Rect fill");
-  }, [map, brushConfig.role, brushConfig.propStyle, brushConfig.replaceSameLayer, activeBrushPalette, selected, placeNonMatrixObjectAt, revealLayer, commitSessionCommand]);
+  }, [map, missingBrush, brushConfig.role, brushConfig.propStyle, brushRole, rawBrushLayer, brushConfig.replaceSameLayer, activeBrushPalette, selected, placeNonMatrixObjectAt, revealLayer, commitSessionCommand]);
 
   const onBucketFill = useCallback((tx: number, ty: number) => {
-    if (!map) return;
-    const targetType = targetLiteTypeForRole(brushConfig.role, brushConfig.propStyle);
+    if (!map || missingBrush || tilesetEdit.current) return;
+    const targetType = targetLiteTypeForBrush(brushConfig.role, brushConfig.propStyle, activeBrushPalette);
     if (!isMatrixBrushType(targetType)) {
       placeNonMatrixObjectAt(tx, ty);
       return;
     }
     const resolved = resolveOrCreateBrushTarget(
       map,
-      brushConfig.role,
+      brushRole,
       activeBrushPalette,
       brushConfig.propStyle,
       selected,
+      false,
+      activeBrushPalette?.tilesetId ? [tx, ty] : undefined,
+      rawBrushLayer ?? undefined,
     );
     const beforeMap = new Map<number, TerrainSnapshot>();
     if (!resolved.created && resolved.object.terrain) {
@@ -856,7 +1051,7 @@ export default function App() {
     setSelected(new Set([resolved.object.id]));
     setAnchorId(resolved.object.id);
     commitSessionCommand(session, "Flood fill");
-  }, [map, brushConfig.role, brushConfig.propStyle, activeBrushPalette, selected, placeNonMatrixObjectAt, revealLayer, commitSessionCommand]);
+  }, [map, missingBrush, brushConfig.role, brushConfig.propStyle, brushRole, rawBrushLayer, activeBrushPalette, selected, placeNonMatrixObjectAt, revealLayer, commitSessionCommand]);
 
   const onEyedropper = useCallback((tx: number, ty: number) => {
     if (!map) return;
@@ -873,11 +1068,11 @@ export default function App() {
   }, [map, selectSingle]);
 
   // Ctrl-toggle membership; only within the active layer (else switch + single).
-  const toggleSelect = useCallback((id: number) => {
+  const toggleSelect = useCallback((id: number, syncBrush = true) => {
     if (!map) return;
     const ly = layerOfObject(map, id);
     if (!ly) return;
-    if (ly.id !== activeLayerId) { selectSingle(id); return; }
+    if (ly.id !== activeLayerId) { selectSingle(id, syncBrush); return; }
     setSelected((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id); else next.add(id);
@@ -889,10 +1084,10 @@ export default function App() {
   const selectRange = useCallback((id: number) => {
     if (!map) return;
     const ly = layerOfObject(map, id);
-    if (!ly || anchorId == null || ly.id !== activeLayerId) { selectSingle(id); return; }
+    if (!ly || anchorId == null || ly.id !== activeLayerId) { selectSingle(id, false); return; }
     const ai = ly.objects.findIndex((o) => o.id === anchorId);
     const ti = ly.objects.findIndex((o) => o.id === id);
-    if (ai < 0 || ti < 0) { selectSingle(id); return; }
+    if (ai < 0 || ti < 0) { selectSingle(id, false); return; }
     const [lo, hi] = ai <= ti ? [ai, ti] : [ti, ai];
     setSelected(new Set(ly.objects.slice(lo, hi + 1).map((o) => o.id)));
     revealLayer(ly.id);
@@ -906,8 +1101,8 @@ export default function App() {
 
   const onObjectClick = useCallback((id: number, mods: { ctrl: boolean; shift: boolean }) => {
     if (mods.shift) selectRange(id);
-    else if (mods.ctrl) toggleSelect(id);
-    else selectSingle(id);
+    else if (mods.ctrl) toggleSelect(id, false);
+    else selectSingle(id, false);
   }, [selectRange, toggleSelect, selectSingle]);
 
   // Marquee release: select active-layer objects whose rect intersects the box.
@@ -1788,11 +1983,20 @@ export default function App() {
     rgb: brushRgb,
     size: brushConfig.size,
     erase: brushConfig.tool === "eraser",
-    ready: brushConfig.tool !== "select",
+    ready: brushConfig.tool !== "select" && !missingBrush,
     tool: brushConfig.tool,
   };
   const canUndo = undo.current.canUndo;
   const canRedo = undo.current.canRedo;
+  const currentDraftKey = map?.id ? draftKey(map.id) : null;
+  const currentDraft = drafts.some((draft) => draft.key === currentDraftKey);
+  const expectedPack = map?.pack;
+  const packMismatch = expectedPack && pack && expectedPack.id !== pack.reference.id;
+  const missingTilesets = useMemo(() => {
+    if (!map || !tilesetsReady) return [];
+    const available = new Set(combined.error ? [] : tilesets.map(({ source }) => source.id));
+    return [...usedTilesetIds(map)].filter((id) => !available.has(id)).map(tilesetName);
+  }, [map, version, tilesetsReady, tilesets, combined.error]);
 
   return (
     <div className="app">
@@ -1805,7 +2009,29 @@ export default function App() {
           📂 {lang === 'zh' ? '打开蓝图/存档…' : 'Open Blueprint/Save…'}
         </button>
         <input ref={fileInput} type="file" accept=".json" hidden
-          onChange={(e) => e.target.files?.[0] && loadFile(e.target.files[0])} />
+          onChange={(e) => {
+            const file = e.currentTarget.files?.[0];
+            e.currentTarget.value = "";
+            if (file) void loadFile(file);
+          }} />
+        {drafts.length > 0 && (
+          <select
+            className="draft-select"
+            aria-label={lang === "zh" ? "恢复草稿" : "Restore Draft"}
+            value=""
+            onChange={(e) => {
+              if (!resumeDraft(e.currentTarget.value)) {
+                setDrafts(listDrafts());
+                setError(lang === "zh" ? "无法读取该草稿" : "Unable to read this draft");
+              }
+            }}
+          >
+            <option value="" disabled>{lang === "zh" ? "恢复草稿…" : "Restore Draft…"}</option>
+            {drafts.map((draft) => (
+              <option key={draft.key} value={draft.key}>{draft.name} · {new Date(draft.savedAt).toLocaleString()}</option>
+            ))}
+          </select>
+        )}
         {map && (
           <>
             <button onClick={() => setResizeMapOpen(true)} title={lang === "zh" ? "调整地图宽高尺寸 (9宫格锚点)" : "Resize Map Dimensions"}>
@@ -1865,7 +2091,7 @@ export default function App() {
           </>
         )}
         <span className="spacer" />
-        {map && <span className="stat">{map.name}{version > 0 && <em className="muted">{lang === 'zh' ? ' · 进度已存本地' : ' · Saved locally'}</em>}</span>}
+        {map && <span className="stat">{map.name}{currentDraft && !draftFailed && <em className="muted">{lang === 'zh' ? ' · 草稿已存本地' : ' · Draft saved locally'}</em>}</span>}
         <button
           style={{
             marginLeft: '8px',
@@ -1888,6 +2114,21 @@ export default function App() {
       </header>
 
       {error && <div className="error">{error}</div>}
+      {draftFailed && <div className="error" role="status">{lang === "zh" ? "本地草稿保存失败，请导出存档以保留进度。" : "Could not save a local draft. Export a save file to keep your progress."}</div>}
+      {(tilesetError || combined.error) && <div className="pack-warning" role="status">{tilesetError || combined.error}</div>}
+      {missingTilesets.length > 0 && <div className="pack-warning" role="status">
+        {lang === "zh" ? `请导入地图使用的 Tileset：${missingTilesets.join("、")}` : `Import the tilesets used by this map: ${missingTilesets.join(", ")}`}
+      </div>}
+      {packError && <div className="pack-warning" role="status">
+        {lang === "zh"
+          ? `资源包${expectedPack ? `「${expectedPack.name}」(${expectedPack.id})` : ""}不可用。${packError}`
+          : `Palette pack${expectedPack ? ` “${expectedPack.name}” (${expectedPack.id})` : ""} is unavailable. ${packError}`}
+      </div>}
+      {packMismatch && <div className="pack-warning" role="status">
+        {lang === "zh"
+          ? `地图需要资源包「${expectedPack.name}」(${expectedPack.id})，当前使用「${pack.reference.name}」(${pack.reference.id}) 预览，材质可能不同。`
+          : `This map expects “${expectedPack.name}” (${expectedPack.id}). Previewing with “${pack.reference.name}” (${pack.reference.id}) may change its appearance.`}
+      </div>}
 
       {!map ? (
         <div className="dropzone">
@@ -1902,8 +2143,14 @@ export default function App() {
           <RoleTreeBrushPanel
             map={map}
             pack={pack}
+            builtInPack={builtInPack}
+            tilesets={tilesets}
+            tilesetsReady={tilesetsReady}
+            onImportTilesets={importTilesets}
+            onRemoveTileset={removeTileset}
             lang={lang}
             brushConfig={brushConfig}
+            activeBrushPalette={activeBrushPalette}
             onChangeBrushConfig={onChangeBrushConfig}
             activeLayerId={activeLayerId}
             selected={selected}
@@ -2009,10 +2256,10 @@ export default function App() {
                         viewRole="scene"
                         map={map}
                         version={version}
+                        isPainting={isPainting}
                         pack={pack}
                         bindings={bindings}
                         renderMode={renderMode}
-                        packVersion={packVersion}
                         selected={selected}
                         player={player}
                         onChangePlayer={setPlayer}
@@ -2044,10 +2291,10 @@ export default function App() {
                         viewRole="game"
                         map={map}
                         version={version}
+                        isPainting={isPainting}
                         pack={pack}
                         bindings={bindings}
                         renderMode={renderMode}
-                        packVersion={packVersion}
                         selected={selected}
                         player={player}
                         onChangePlayer={setPlayer}

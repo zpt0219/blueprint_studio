@@ -4,6 +4,7 @@
 import {
   DEFAULT_FRG_PLACEMENT_MODE,
   assignUniqueObjectNames,
+  createMapAlignedTerrain,
   displayName,
   isLocked,
   roleOf,
@@ -15,7 +16,7 @@ import {
 } from "./model";
 import { createCategoryLayer } from "./loadSave";
 import { objectTypeForRole, roleRoot, stratumForRole } from "./roleTree";
-import type { Palette } from "./pack/types";
+import { PaletteMode, type Palette } from "./pack/types";
 
 export type BrushToolId = "brush" | "eraser" | "rect" | "bucket" | "eyedropper" | "select";
 export type BrushShape = "square" | "circle";
@@ -119,6 +120,14 @@ export function isMatrixBrushType(t: LiteType): boolean {
   return t === "TERRAIN_2_CORNER" || t === "TERRAIN_2_EDGE" || t === "FIXED_RECT_GROUP";
 }
 
+export function targetLiteTypeForBrush(role: string, propStyle: PropBrushStyle, palette: Palette | null): LiteType {
+  if (!palette?.tilesetId) return targetLiteTypeForRole(role, propStyle);
+  if (palette.mode === PaletteMode.TWO_CORNER) return "TERRAIN_2_CORNER";
+  if (palette.mode === PaletteMode.TWO_EDGE) return "TERRAIN_2_EDGE";
+  return palette.mode === PaletteMode.FIXED_RECT && palette.size[0] === 1 && palette.size[1] === 1
+    ? "FIXED_RECT_GROUP" : "FIXED_RECT";
+}
+
 export function ensureLayerForRole(map: LiteTileMap, role: string): Layer {
   const root = roleRoot(role) || "terrain";
   const existing = map.layers.find((l) => (l.tags["role.root"] || l.name) === root);
@@ -142,13 +151,12 @@ function objectMatchesBrush(o: LiteObject, role: string, paletteHash: string | n
   if (isLocked(o) || !o.enabled || o.type !== expectedType) return false;
   if (roleOf(o) !== role) return false;
   if (!paletteHash) return true;
-  if (o.type === "FIXED_RECT_GROUP") {
-    if (o.frg && o.frg.cells.length > 0) {
-      return o.frg.cells.some((c) => c.palette === paletteHash);
-    }
-    return (o.tags["web.palette"] || "") === paletteHash;
-  }
-  return (o.tags["web.palette"] || "") === paletteHash;
+  return objectUsesBrushPalette(o, paletteHash);
+}
+
+export function objectUsesBrushPalette(o: LiteObject, paletteHash: string): boolean {
+  if (o.type === "FIXED_RECT_GROUP" && o.frg?.cells.length) return o.frg.cells.some((c) => c.palette === paletteHash);
+  return o.tags["web.palette"] === paletteHash;
 }
 
 export interface ResolvedBrushTarget {
@@ -170,16 +178,19 @@ export function resolveOrCreateBrushTarget(
   propStyle: PropBrushStyle,
   selected: Set<number>,
   forceNew = false,
+  origin: [number, number] = [0, 0],
+  layerOverride?: Layer,
 ): ResolvedBrushTarget {
-  const layer = ensureLayerForRole(map, role);
-  const targetType = targetLiteTypeForRole(role, propStyle);
+  const layer = layerOverride ?? ensureLayerForRole(map, role);
+  const targetType = targetLiteTypeForBrush(role, propStyle, palette);
   const paletteHash = palette?.hash ?? null;
 
   if (!forceNew) {
     // 1. Check current selection first
     for (const id of selected) {
       const selObj = layer.objects.find((o) => o.id === id);
-      if (selObj && isMatrixBrushType(selObj.type) && roleOf(selObj) === role && !isLocked(selObj)) {
+      if (selObj && isMatrixBrushType(selObj.type) && roleOf(selObj) === role && !isLocked(selObj)
+        && (!palette?.tilesetId || selObj.type === targetType)) {
         if (!paletteHash || objectMatchesBrush(selObj, role, paletteHash, selObj.type)) {
           return { layer, object: selObj, created: false };
         }
@@ -196,7 +207,7 @@ export function resolveOrCreateBrushTarget(
 
   // 3. Create new matrix object on demand
   const id = nextObjectId(map);
-  const baseName = role.split("/").slice(-1)[0] || role;
+  const baseName = palette?.tilesetId ? palette.style || palette.label || role : role.split("/").slice(-1)[0] || role;
   const tags: Record<string, string> = {
     "blueprint.role": role,
     "web.baseName": baseName,
@@ -207,13 +218,18 @@ export function resolveOrCreateBrushTarget(
     tags["web.palette"] = paletteHash;
   }
 
+  const geometry: Pick<LiteObject, "rect" | "terrain"> = targetType === "TERRAIN_2_CORNER" || targetType === "TERRAIN_2_EDGE"
+    ? createMapAlignedTerrain(map)
+    : {
+        rect: [origin[0], origin[1], 1, 1],
+        terrain: { ox: origin[0], oy: origin[1], w: 1, h: 1, data: Int16Array.of(-1) },
+      };
   const createdObj: LiteObject = {
     id,
     type: targetType,
-    rect: [0, 0, 1, 1],
     enabled: true,
     tags,
-    terrain: { ox: 0, oy: 0, w: 1, h: 1, data: Int16Array.of(-1) },
+    ...geometry,
     ...(targetType === "FIXED_RECT_GROUP" && paletteHash
       ? {
           frg: {

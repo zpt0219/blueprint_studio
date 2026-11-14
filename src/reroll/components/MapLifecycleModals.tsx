@@ -1,10 +1,11 @@
 import { useState } from "react";
+import { DEFAULT_TILE_RESOLUTION } from "../model";
 
 export interface NewMapModalProps {
   open: boolean;
   lang: "zh" | "en";
   onClose: () => void;
-  onCreate: (name: string, width: number, height: number, baseRole: string | null) => void;
+  onCreate: (name: string, width: number, height: number, baseRole: string | null, tileResolution: number) => void;
 }
 
 const BASE_TERRAIN_OPTIONS = [
@@ -20,9 +21,12 @@ export function NewMapModal({ open, lang, onClose, onCreate }: NewMapModalProps)
   const [name, setName] = useState("new_village");
   const [width, setWidth] = useState(48);
   const [height, setHeight] = useState(36);
+  const [tileResolution, setTileResolution] = useState(String(DEFAULT_TILE_RESOLUTION));
   const [baseRole, setBaseRole] = useState("terrain/grass");
 
   if (!open) return null;
+  const resolution = Number(tileResolution);
+  const validResolution = Number.isSafeInteger(resolution) && resolution >= 1 && resolution <= 256;
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -73,16 +77,20 @@ export function NewMapModal({ open, lang, onClose, onCreate }: NewMapModalProps)
             </label>
           </div>
 
-          <label className="lf-field">
-            <span>{lang === "zh" ? "初始底层地表 (terrain)" : "Initial Base Terrain"}</span>
-            <select value={baseRole} onChange={(e) => setBaseRole(e.target.value)}>
-              {BASE_TERRAIN_OPTIONS.map((opt) => (
-                <option key={opt.role} value={opt.role}>
-                  {lang === "zh" ? opt.zh : opt.en}
-                </option>
-              ))}
-            </select>
-          </label>
+          <div className="lf-row-2">
+            <label className="lf-field">
+              <span>{lang === "zh" ? "瓦片分辨率（像素）" : "Tile Resolution (px)"}</span>
+              <input type="number" min={1} max={256} value={tileResolution} onChange={(e) => setTileResolution(e.target.value)} />
+            </label>
+            <label className="lf-field">
+              <span>{lang === "zh" ? "初始底层地表 (terrain)" : "Initial Base Terrain"}</span>
+              <select value={baseRole} onChange={(e) => setBaseRole(e.target.value)}>
+                {BASE_TERRAIN_OPTIONS.map((opt) => (
+                  <option key={opt.role} value={opt.role}>{lang === "zh" ? opt.zh : opt.en}</option>
+                ))}
+              </select>
+            </label>
+          </div>
         </div>
 
         <div className="modal-foot">
@@ -92,8 +100,9 @@ export function NewMapModal({ open, lang, onClose, onCreate }: NewMapModalProps)
           <button
             type="button"
             className="active"
+            disabled={!validResolution}
             onClick={() => {
-              onCreate(name || "new_map", width, height, baseRole || null);
+              onCreate(name || "new_map", width, height, baseRole || null, resolution);
               onClose();
             }}
           >

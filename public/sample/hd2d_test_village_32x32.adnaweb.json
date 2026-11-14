@@ -5181,7 +5181,7 @@
       "enabled": true,
       "tags": {
         "role.root": "spawner",
-        "role.stratum": "vertical"
+        "role.stratum": "ground"
       },
       "objects": [
         {

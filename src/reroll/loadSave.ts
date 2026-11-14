@@ -4,6 +4,7 @@
 
 import {
   DEFAULT_FRG_PLACEMENT_MODE,
+  DEFAULT_TILE_RESOLUTION,
   assignUniqueObjectNames,
   type FrgPlacementMode,
   type HouseDecorationKind,
@@ -13,8 +14,8 @@ import {
   type Rect,
   type TerrainMatrix,
 } from "./model";
-import { WEB_SAVE_FORMAT, type WebSaveFile, type WebSaveLayer, type WebSaveObject } from "./saveFormat";
-import { applyNoiseConfig } from "./terrainNoise";
+import { WEB_SAVE_FORMAT, WEB_SAVE_VERSION, type WebSaveFile, type WebSaveLayer, type WebSaveObject } from "./saveFormat";
+import { applyNoiseConfig, DEFAULT_FRG_NOISE_CONFIG, noiseConfigFromTags } from "./terrainNoise";
 import { stratumForRole, topRoleNode, topRoleOrder } from "./roleTree";
 import type { Vec2 } from "./types";
 
@@ -66,12 +67,11 @@ function restoreObject(src: WebSaveObject, id: number): LiteObject {
     case "FIXED_RECT_GROUP": {
       obj.terrain = buildTerrainFromCells(rect, src.cells);
       if (src.type === "FIXED_RECT_GROUP" && src.frg) {
-        if (src.frg.noise) {
-          tags = applyNoiseConfig(tags, "web.frg", {
-            seed: src.frg.noise.seed,
-            scale: src.frg.noise.scale,
-            range: [src.frg.noise.range[0], src.frg.noise.range[1]],
-          });
+        const noise = src.frg.noise;
+        const current = noiseConfigFromTags(tags, "web.frg", DEFAULT_FRG_NOISE_CONFIG);
+        if (noise && (noise.seed !== current.seed || noise.scale !== current.scale ||
+          noise.range[0] !== current.range[0] || noise.range[1] !== current.range[1])) {
+          tags = applyNoiseConfig(tags, "web.frg", noise);
           obj.tags = tags;
         }
         obj.frg = {
@@ -130,12 +130,21 @@ export function webSaveToLite(save: WebSaveFile): LiteTileMap {
   if (!isWebSaveFile(save)) {
     throw new Error(`Invalid save format: expected "${WEB_SAVE_FORMAT}"`);
   }
+  if (!Number.isInteger(save.version) || save.version < 1 || save.version > WEB_SAVE_VERSION) {
+    throw new Error(`Unsupported ${WEB_SAVE_FORMAT} version: ${save.version}`);
+  }
   let nextObj = 0;
   let nextLayer = 0;
   const isBlueprint = save.layers.some((l) => l.tags?.["adna.kind"] === "blueprint");
   const layers = save.layers.map((l) => restoreLayer(l, nextLayer++, () => nextObj++));
+  const pack = save.pack;
   return {
+    ...(typeof save.id === "string" && save.id.trim() ? { id: save.id } : {}),
     name: save.name || "untitled",
+    tileResolution: Number.isSafeInteger(save.tileResolution) && save.tileResolution > 0
+      ? save.tileResolution : DEFAULT_TILE_RESOLUTION,
+    ...(typeof pack?.id === "string" && pack.id.trim() && typeof pack.name === "string"
+      ? { pack: { id: pack.id, name: pack.name } } : {}),
     layers,
     isBlueprint,
     width: Math.max(1, Math.round(save.width || 64)),
@@ -169,6 +178,7 @@ export function createBlankMap(
   width: number,
   height: number,
   baseTerrainRole: string | null = "terrain/grass",
+  tileResolution = DEFAULT_TILE_RESOLUTION,
 ): LiteTileMap {
   const w = Math.max(4, Math.min(512, Math.round(width)));
   const h = Math.max(4, Math.min(512, Math.round(height)));
@@ -202,6 +212,7 @@ export function createBlankMap(
 
   const map: LiteTileMap = {
     name: name.trim() || "new_map",
+    tileResolution,
     layers,
     isBlueprint: true,
     width: w,

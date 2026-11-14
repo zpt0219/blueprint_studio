@@ -2,6 +2,8 @@
 // tile_map_editor_imgui/web/blueprint_to_palette.md §7). A pack is a zip of
 // manifest.json + palettes.json + atlas.png (+ atlas.adnastyle, unused here).
 
+import type { PalettePackRef } from "../model";
+
 /** Palette::Mode ints from the engine (src/core/palette.h). Only the ones that
  *  appear in the shipped pack matter; the rest are listed for completeness. */
 export enum PaletteMode {
@@ -36,6 +38,9 @@ export interface ManifestPalette {
 
 export interface PackManifest {
   kind: string;
+  packId?: string;
+  packVersion?: number;
+  name?: string;
   atlas: { path: string; width: number; height: number; tileResolution: number; styleSidecar?: string };
   paletteCount: number;
   palettes: ManifestPalette[];
@@ -64,6 +69,9 @@ export interface MappingMatrix {
 /** A merged, decoded palette (manifest entry ⋈ palettes.json record). */
 export interface Palette {
   hash: string;
+  tilesetId?: string;
+  label?: string;
+  rawTile?: boolean;
   mode: PaletteMode;
   role: string;
   style: string;
@@ -79,7 +87,8 @@ export interface Palette {
 /** Everything the renderer needs once a pack is loaded. (atlas is drawImage-able:
  *  an ImageBitmap normally, or an HTMLImageElement where createImageBitmap fails.) */
 export interface PackRuntime {
-  atlas: CanvasImageSource;
+  reference: PalettePackRef;
+  atlas: ImageBitmap | HTMLImageElement | HTMLCanvasElement;
   tileResolution: number;
   palettes: Palette[];
 }

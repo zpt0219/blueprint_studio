@@ -11,10 +11,10 @@ export interface Hd2dViewProps {
   viewRole: "scene" | "game";
   map: LiteTileMap;
   version: number;
+  isPainting: boolean;
   pack: PackRuntime | null;
   bindings: Bindings | null;
   renderMode: RenderMode;
-  packVersion: number;
   selected: Set<number>;
   player: PlayerState;
   onChangePlayer: (next: PlayerState | ((prev: PlayerState) => PlayerState)) => void;
@@ -28,10 +28,10 @@ export function Hd2dView({
   viewRole,
   map,
   version,
+  isPainting,
   pack,
   bindings,
   renderMode,
-  packVersion,
   selected,
   player,
   onChangePlayer,
@@ -238,29 +238,26 @@ export function Hd2dView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Rebuild 3D geometry & textures when map/pack/options change
+  // Keep the 2D brush responsive by rebuilding 3D once the stroke commits.
   useEffect(() => {
     const world = worldRef.current;
-    if (!world) return;
+    if (!world || isPainting) return;
     world.rebuild(map, pack, bindings, {
       renderMode,
       // Game View always renders compact authentic game layers (stackExplode = 1, showGrid = false)
       stackExplode: isSceneView ? stackExplode : 1,
       billboardSprites: billboard,
       showGrid: isSceneView ? showGrid : false,
+      isSceneView,
     });
-    if (isSceneView) {
-      world.updateSelectionBoxes(map, selected);
-    }
-    world.syncPlayerAndGameCameraGizmo(playerRef.current, isSceneView, gameZoom);
-  }, [map, version, pack, bindings, renderMode, packVersion, isSceneView, stackExplode, billboard, showGrid, selected, gameZoom]);
+  }, [map, version, isPainting, pack, bindings, renderMode, isSceneView, stackExplode, billboard, showGrid]);
 
   // Update 3D selection highlight boxes whenever `selected` changes in Scene View
   useEffect(() => {
     const world = worldRef.current;
-    if (!world || !isSceneView) return;
+    if (!world || !isSceneView || isPainting) return;
     world.updateSelectionBoxes(map, selected);
-  }, [map, selected, version, isSceneView]);
+  }, [map, selected, version, isSceneView, isPainting]);
 
   // Keyboard listener for WASD walk in Game View
   useEffect(() => {

@@ -1,4 +1,4 @@
-import { DEFAULT_FRG_PLACEMENT_MODE, type LiteObject, type LiteTileMap } from "./model";
+import { DEFAULT_FRG_PLACEMENT_MODE, createMapAlignedTerrain, type LiteObject, type LiteTileMap } from "./model";
 import { makeHouse } from "./house";
 
 export type CreateKind = "terrain_area" | "terrain_line" | "fixed_rect" | "fixed_rect_group" | "house";
@@ -39,24 +39,17 @@ export function createObjectForRole(
   };
   if (options.style) tags["blueprint.style"] = options.style;
   if (options.paletteHash && kind !== "house" && kind !== "fixed_rect_group") tags["web.palette"] = options.paletteHash;
-  if (kind === "terrain_area") {
+  if (kind === "terrain_area" || kind === "terrain_line") {
+    const geometry = createMapAlignedTerrain(map);
+    if (x >= 0 && y >= 0 && x < map.width && y < map.height) {
+      geometry.terrain.data[y * map.width + x] = 0;
+    }
     return {
       id,
-      type: "TERRAIN_2_CORNER",
-      rect: [x, y, 1, 1],
+      type: kind === "terrain_area" ? "TERRAIN_2_CORNER" : "TERRAIN_2_EDGE",
       enabled: true,
       tags,
-      terrain: { ox: x, oy: y, w: 1, h: 1, data: Int16Array.of(0) },
-    };
-  }
-  if (kind === "terrain_line") {
-    return {
-      id,
-      type: "TERRAIN_2_EDGE",
-      rect: [x, y, 1, 1],
-      enabled: true,
-      tags,
-      terrain: { ox: x, oy: y, w: 1, h: 1, data: Int16Array.of(0) },
+      ...geometry,
     };
   }
   if (kind === "fixed_rect_group") {

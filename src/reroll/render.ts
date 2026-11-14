@@ -3,7 +3,7 @@
 // plus editor overlays (selection, lock badge, drag ghost). No React / DOM state.
 
 import type { HouseData, LiteObject, LiteTileMap, Rect } from "./model";
-import { eachVisibleDrawOrder, eachVisibleObject, isLocked, roleOf } from "./model";
+import { eachVisibleDrawOrder, eachVisibleObject, isLocked, isLogicalRole, roleOf } from "./model";
 import { colorForRole, rgbaCss, type RGB } from "./generated/roleColors";
 import { mappingCell, type Palette, type PackRuntime } from "./pack/types";
 import type { Bindings } from "./pack/compile";
@@ -396,7 +396,37 @@ function drawObjectToScene(ctx: CanvasRenderingContext2D, o: LiteObject, s: numb
 
 // The abstract role-colour drawing of one object (overlay view + mixed fallback).
 function drawObjectColor(ctx: CanvasRenderingContext2D, o: LiteObject, s: number, clip: Rect | null): void {
-  const rgb = colorForRole(roleOf(o));
+  const role = roleOf(o);
+  if (isLogicalRole(role)) {
+    const [x, y, w, h] = o.rect;
+    const cx = (x + w / 2) * s;
+    const cy = (y + h / 2) * s;
+    const r = Math.max(s * 0.35, Math.min(w, h) * s * 0.42);
+    ctx.save();
+    ctx.fillStyle = "rgba(56, 189, 248, 0.22)";
+    ctx.strokeStyle = "rgba(56, 189, 248, 0.95)";
+    ctx.lineWidth = Math.max(1.5, s * 0.08);
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    // Inner crosshair
+    ctx.beginPath();
+    ctx.moveTo(cx - r * 1.15, cy);
+    ctx.lineTo(cx + r * 1.15, cy);
+    ctx.moveTo(cx, cy - r * 1.15);
+    ctx.lineTo(cx, cy + r * 1.15);
+    ctx.stroke();
+    // Center dot
+    ctx.fillStyle = "rgba(255, 255, 255, 0.9)";
+    ctx.beginPath();
+    ctx.arc(cx, cy, Math.max(2, s * 0.1), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    return;
+  }
+
+  const rgb = colorForRole(role);
   switch (o.type) {
     case "FIXED_RECT":
     case "HOUSE": {

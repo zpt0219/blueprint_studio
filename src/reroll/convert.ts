@@ -8,7 +8,7 @@
 // invalid object instead of aborting the whole import).
 
 import type { BlueprintLayer, BlueprintObject, LoadedBlueprint, Vec2 } from "./types";
-import type { Layer, LiteObject, LiteType, Rect, TerrainMatrix } from "./model";
+import { DEFAULT_TILE_RESOLUTION, type Layer, type LiteObject, type LiteType, type Rect, type TerrainMatrix } from "./model";
 import { makeHouse } from "./house";
 
 // Inclusive integer bounds, matching the engine's Recti (minX..maxX inclusive).
@@ -283,5 +283,5 @@ export function blueprintToLite(loaded: LoadedBlueprint): import("./model").Lite
   const layers: Layer[] = [];
   flattenLayer(loaded.root, true, "", 0, alloc, layers);
   const isBlueprint = layers.length > 0 && layers[0].tags["adna.kind"] === "blueprint";
-  return { name: loaded.name, layers, isBlueprint, width: loaded.width, height: loaded.height, sizeInferred: loaded.sizeInferred };
+  return { name: loaded.name, layers, isBlueprint, width: loaded.width, height: loaded.height, tileResolution: DEFAULT_TILE_RESOLUTION, sizeInferred: loaded.sizeInferred };
 }

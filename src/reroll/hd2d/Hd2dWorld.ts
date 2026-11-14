@@ -6,7 +6,7 @@
 //    and real-time WASD walk/collision testing).
 
 import * as THREE from "three";
-import { findObject, roleOf, type HouseData, type LiteObject, type LiteTileMap, type Rect } from "../model";
+import { findObject, isLogicalRole, roleOf, type HouseData, type LiteObject, type LiteTileMap, type Rect } from "../model";
 import { colorForRole, rgbaCss } from "../generated/roleColors";
 import { type Palette, type PackRuntime } from "../pack/types";
 import type { Bindings } from "../pack/compile";
@@ -25,6 +25,8 @@ export interface Hd2dRenderOptions {
   billboardSprites: boolean;
   /** Show subtle 3D tile grid overlay (Scene View only). */
   showGrid: boolean;
+  /** True in 3D Scene View (enables editor gizmos like spawn pads); false in Game View. */
+  isSceneView?: boolean;
 }
 
 export interface PlayerState {
@@ -1021,6 +1023,88 @@ export class Hd2dWorld {
     return group;
   }
 
+  /**
+   * Procedural HD-2D Ground Gizmo for logical entities (spawners, triggers, markers).
+   * Renders a sleek glowing ground rune/disc in Scene View; clickable with raycaster.
+   */
+  private buildLogicalGizmo(o: LiteObject, elev: number): THREE.Group {
+    const group = new THREE.Group();
+    const [rx, ry, rw, rh] = o.rect;
+    const cx = rx + rw / 2;
+    const cz = ry + rh / 2;
+    const role = roleOf(o);
+    const isPlayerSpawn = role.includes("player");
+
+    // Circular canvas decal on the floor
+    const cv = document.createElement("canvas");
+    cv.width = 128;
+    cv.height = 128;
+    const ctx = cv.getContext("2d")!;
+    const center = 64;
+
+    // Glowing cyan/gold gradient
+    const grad = ctx.createRadialGradient(center, center, 8, center, center, 60);
+    if (isPlayerSpawn) {
+      grad.addColorStop(0, "rgba(56, 189, 248, 0.45)");
+      grad.addColorStop(0.7, "rgba(56, 189, 248, 0.12)");
+      grad.addColorStop(1, "rgba(56, 189, 248, 0)");
+    } else {
+      grad.addColorStop(0, "rgba(251, 191, 36, 0.45)");
+      grad.addColorStop(0.7, "rgba(251, 191, 36, 0.12)");
+      grad.addColorStop(1, "rgba(251, 191, 36, 0)");
+    }
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 128, 128);
+
+    // Outer beacon circle
+    ctx.strokeStyle = isPlayerSpawn ? "rgba(56, 189, 248, 0.85)" : "rgba(251, 191, 36, 0.85)";
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.arc(center, center, 44, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Inner dashed guide
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.arc(center, center, 28, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Crosshair lines
+    ctx.beginPath();
+    ctx.moveTo(center, 12);
+    ctx.lineTo(center, 116);
+    ctx.moveTo(12, center);
+    ctx.lineTo(116, center);
+    ctx.stroke();
+
+    // Center jewel / dot
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath();
+    ctx.arc(center, center, 6, 0, Math.PI * 2);
+    ctx.fill();
+
+    const tex = this.trackTex(makeSmoothCanvasTexture(cv));
+    const size = Math.max(rw, rh, 1);
+    const padGeo = this.trackGeo(new THREE.PlaneGeometry(size * 1.15, size * 1.15));
+    padGeo.rotateX(-Math.PI / 2);
+    const padMat = this.trackMat(
+      new THREE.MeshBasicMaterial({
+        map: tex,
+        transparent: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      }),
+    );
+    const mesh = new THREE.Mesh(padGeo, padMat);
+    mesh.position.set(cx, elev + 0.025, cz);
+    mesh.userData = { objectId: o.id, tile: [rx, ry] };
+    this.groundPickables.push(mesh);
+    group.add(mesh);
+
+    return group;
+  }
+
   /** Rebuild the 3D multi-image stacked scene from `LiteTileMap`. */
   rebuild(
     map: LiteTileMap,
@@ -1398,6 +1482,17 @@ export class Hd2dWorld {
           continue;
         }
 
+        // 5-Gizmo. Logical / Editor Gizmo Entities (spawner/*, trigger/*, marker/*)
+        if (isLogicalRole(role)) {
+          if (opts.isSceneView) {
+            const [rx, ry, rw, rh] = o.rect;
+            const elev = this.elevationAt(rx + Math.floor(rw / 2), ry + Math.floor(rh / 2));
+            const gizmoGroup = this.buildLogicalGizmo(o, elev);
+            this.worldRoot.add(gizmoGroup);
+          }
+          continue;
+        }
+
         // 5C. Flat Ground / Road / Paving / Grass Surface Plane
         const cv = renderObjectLocalCanvas(o, s, pack, bindings, opts.renderMode);
         if (!cv) continue;
@@ -1458,27 +1553,40 @@ export class Hd2dWorld {
         const rgb = colorForRole(role);
         const b = pack && bindings && opts.renderMode !== "blueprint" ? bindings.get(o.id) : undefined;
 
-        if (o.type === "HOUSE" || o.type === "FIXED_RECT") {
-          const [rx, ry, rw, rh] = o.rect;
-          for (let y = Math.max(0, ry); y < Math.min(map.height, ry + rh); y++) {
-            for (let x = Math.max(0, rx); x < Math.min(map.width, rx + rw); x++) {
-              this.blockedGrid[y * map.width + x] = 1;
+        if (!isLogicalRole(role)) {
+          if (o.type === "HOUSE" || o.type === "FIXED_RECT") {
+            const [rx, ry, rw, rh] = o.rect;
+            for (let y = Math.max(0, ry); y < Math.min(map.height, ry + rh); y++) {
+              for (let x = Math.max(0, rx); x < Math.min(map.width, rx + rw); x++) {
+                this.blockedGrid[y * map.width + x] = 1;
+              }
             }
-          }
-        } else if (
-          o.terrain &&
-          (role.startsWith("boundary/") || role.startsWith("nature_prop/tree") || role.startsWith("nature_prop/rock"))
-        ) {
-          const t = o.terrain;
-          for (let r = 0; r < t.h; r++) {
-            for (let c = 0; c < t.w; c++) {
-              if (t.data[r * t.w + c] < 0) continue;
-              const wx = t.ox + c, wy = t.oy + r;
-              if (wx >= 0 && wy >= 0 && wx < map.width && wy < map.height) {
-                this.blockedGrid[wy * map.width + wx] = 1;
+          } else if (
+            o.terrain &&
+            (role.startsWith("boundary/") || role.startsWith("nature_prop/tree") || role.startsWith("nature_prop/rock"))
+          ) {
+            const t = o.terrain;
+            for (let r = 0; r < t.h; r++) {
+              for (let c = 0; c < t.w; c++) {
+                if (t.data[r * t.w + c] < 0) continue;
+                const wx = t.ox + c, wy = t.oy + r;
+                if (wx >= 0 && wy >= 0 && wx < map.width && wy < map.height) {
+                  this.blockedGrid[wy * map.width + wx] = 1;
+                }
               }
             }
           }
+        }
+
+        // 6-Gizmo. Logical / Editor Gizmo Entities (spawner/*, trigger/*, marker/*)
+        if (isLogicalRole(role)) {
+          if (opts.isSceneView) {
+            const [rx, ry, rw, rh] = o.rect;
+            const elev = this.elevationAt(rx + Math.floor(rw / 2), ry + Math.floor(rh / 2));
+            const gizmoGroup = this.buildLogicalGizmo(o, elev);
+            this.worldRoot.add(gizmoGroup);
+          }
+          continue;
         }
 
         // 6A. Procedural 3D Cottage / House (`HOUSE`)

@@ -12716,7 +12716,7 @@ exports[`Golden Convert Pipeline > converts test_village_strict blueprint to nor
   ],
   "name": "test_village_strict",
   "tileResolution": 16,
-  "version": 3,
+  "version": 4,
   "width": 100,
 }
 `;

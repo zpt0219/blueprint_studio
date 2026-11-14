@@ -1,11 +1,13 @@
 // loadPack.ts — unzip an `.adnapalettepack` and build a PackRuntime.
 
 import { unzipSync, strFromU8 } from "fflate";
+import { contentId } from "../contentId";
 import { decodeMappingMatrix } from "./decode";
 import type { Palette, PackManifest, PackRuntime, PaletteRecord } from "./types";
 
 async function parsePackBytes(buf: ArrayBuffer): Promise<PackRuntime> {
-  const files = unzipSync(new Uint8Array(buf));
+  const bytes = new Uint8Array(buf);
+  const files = unzipSync(bytes);
   const manifest = JSON.parse(strFromU8(files["manifest.json"])) as PackManifest;
   const palettesFile = JSON.parse(strFromU8(files["palettes.json"])) as { palettes: PaletteRecord[] };
 
@@ -30,14 +32,18 @@ async function parsePackBytes(buf: ArrayBuffer): Promise<PackRuntime> {
   }
 
   const atlas = await decodeAtlas(files[manifest.atlas.path]);
-  return { atlas, tileResolution: manifest.atlas.tileResolution, palettes };
+  const reference = {
+    id: manifest.packId ? `${manifest.packId}@${manifest.packVersion ?? 1}` : `archive:${contentId(bytes)}`,
+    name: manifest.name || manifest.packId || "Palette Pack",
+  };
+  return { reference, atlas, tileResolution: manifest.atlas.tileResolution, palettes };
 }
 
 // Decode the atlas PNG to something drawImage-able. Prefer createImageBitmap
 // (fast, off-thread); fall back to an HTMLImageElement where it's unavailable or
 // throws (some headless/embedded WebViews), so rendering never silently fails.
-async function decodeAtlas(bytes: Uint8Array): Promise<CanvasImageSource> {
-  const blob = new Blob([bytes as BlobPart], { type: "image/png" });
+export async function decodeAtlas(bytes: Uint8Array | Blob): Promise<ImageBitmap | HTMLImageElement> {
+  const blob = bytes instanceof Blob ? bytes : new Blob([bytes as BlobPart], { type: "image/png" });
   if (typeof createImageBitmap === "function") {
     try { return await createImageBitmap(blob); } catch { /* fall through to <img> */ }
   }

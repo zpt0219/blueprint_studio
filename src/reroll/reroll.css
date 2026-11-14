@@ -37,6 +37,15 @@ body {
   border-bottom: 1px solid var(--border);
 }
 .topbar strong { font-size: 14px; }
+.draft-select {
+  max-width: 130px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px;
+  font-size: 12px;
+}
 .badge {
   font-size: 11px;
   color: var(--muted);
@@ -91,6 +100,13 @@ button.danger:hover {
 .error {
   background: #4a1d1d;
   color: #ffd7d7;
+  padding: 8px 12px;
+  font-size: 13px;
+}
+
+.pack-warning {
+  background: #493819;
+  color: #ffe0a0;
   padding: 8px 12px;
   font-size: 13px;
 }
@@ -810,7 +826,7 @@ button.danger:hover {
 .prop-num { width: 56px; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; font: inherit; }
 .prop-hint { color: var(--muted); font-size: 11px; font-style: italic; margin: 4px 0 2px; }
 
-/* --- 7-Layer Role Tree & Fast Brush Sidebar --- */
+/* --- Painting sidebar --- */
 .role-tree-sidebar {
   display: flex;
   flex-direction: column;
@@ -833,7 +849,16 @@ button.danger:hover {
 .fb-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 8px;
+}
+.fb-current-material {
+  min-width: 0;
+  display: grid;
+}
+.fb-current-material strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .fb-title {
   font-size: 11px;
@@ -927,6 +952,97 @@ button.danger:hover {
   gap: 6px;
   padding-right: 2px;
 }
+.role-tree-scroll[hidden] { display: none; }
+
+.tileset-controls {
+  flex: none;
+  display: grid;
+  gap: 5px;
+}
+.tileset-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.tileset-controls select,
+.tileset-search {
+  width: 100%;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 5px;
+  flex: none;
+}
+.tileset-palette-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(58px, 1fr));
+  align-items: stretch;
+  gap: 4px;
+  flex: none;
+}
+.tileset-palette-grid button {
+  display: grid;
+  justify-items: center;
+  gap: 2px;
+  min-width: 0;
+  padding: 4px;
+}
+.tileset-palette-grid button[aria-pressed="true"] {
+  background: #2b3a55;
+  border-color: var(--accent);
+}
+.tileset-palette-grid span {
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 10px;
+}
+.tileset-palette-grid small { color: var(--muted); }
+.tileset-files { overflow-wrap: anywhere; }
+.tileset-grid-preview {
+  max-width: 100%;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  image-rendering: pixelated;
+}
+.raw-tileset-grid {
+  overflow: auto;
+  min-height: 80px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+.raw-tileset-grid canvas {
+  display: block;
+  image-rendering: pixelated;
+  cursor: crosshair;
+}
+
+.sidebar-tabs {
+  display: flex;
+  gap: 4px;
+  flex: none;
+  padding: 3px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+.sidebar-tabs button {
+  flex: 1;
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+}
+.sidebar-tabs button[aria-selected="true"] {
+  background: #2b3a55;
+  border-color: var(--accent);
+  color: var(--text);
+}
+.sidebar-layer-actions {
+  justify-content: flex-start;
+  flex: none;
+}
 
 .cat-tree-card {
   background: #181c23;
@@ -951,6 +1067,56 @@ button.danger:hover {
 .cat-tree-header:hover {
   background: #2c3340;
 }
+.sidebar-row-button {
+  width: 100%;
+  text-align: left;
+  border: 0;
+  border-radius: 0;
+}
+.sidebar-row-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.sidebar-layer-row { cursor: default; }
+.sidebar-layer-row.is-hidden .cat-title {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+.layer-name-button,
+.role-tree-sidebar .obj-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  padding: 2px;
+  background: transparent;
+  color: inherit;
+}
+.layer-name-button .cat-title { flex: 1; }
+.role-tree-sidebar .obj-name { cursor: inherit; }
+.role-tree-sidebar .obj-name span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.obj-role-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+.layer-visibility {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 23px;
+  height: 23px;
+  padding: 0;
+  background: transparent;
+  border-color: transparent;
+  color: var(--text);
+}
+.layer-visibility[aria-pressed="false"] { color: var(--muted); }
 .cat-caret {
   border: none;
   background: none;
@@ -1002,10 +1168,10 @@ button.danger:hover {
 }
 
 .cat-tree-body {
-  padding: 6px;
+  padding: 4px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 2px;
 }
 
 .role-node-grid {
@@ -1018,23 +1184,31 @@ button.danger:hover {
   flex-direction: column;
   gap: 3px;
 }
+.material-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-right: 4px;
+  border-radius: 6px;
+  background: #1d222b;
+  border: 1px solid transparent;
+}
+.material-row:hover {
+  background: #262d39;
+  border-color: var(--border);
+}
+.material-row.active {
+  background: #283650;
+  border-color: var(--accent);
+}
 .role-node-btn {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 3px 6px;
-  border-radius: 6px;
-  background: #1d222b;
-  border: 1px solid transparent;
-  cursor: pointer;
-}
-.role-node-btn:hover {
-  background: #262d39;
-  border-color: var(--border);
-}
-.role-node-btn.selected {
-  background: #283650;
-  border-color: var(--accent);
+  flex: 1;
+  min-width: 0;
+  padding: 1px 4px;
+  background: transparent;
 }
 .rn-swatch {
   width: 28px;
@@ -1073,9 +1247,10 @@ button.danger:hover {
   text-overflow: ellipsis;
 }
 .rn-variants-btn {
-  font-size: 10px;
-  padding: 2px 6px;
-  border-radius: 99px;
+  flex: none;
+  font-size: 11px;
+  padding: 2px 5px;
+  color: var(--muted);
 }
 
 .role-variants-drawer {
@@ -1145,8 +1320,9 @@ button.danger:hover {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  margin-top: 3px;
+  padding: 3px 5px;
 }
+.cat-objects-list .obj-row { padding: 1px 6px 1px 20px; }
 .cat-obj-row {
   padding-left: 10px;
 }

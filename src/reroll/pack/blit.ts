@@ -15,6 +15,7 @@ export function blitTile(
   dy: number,
   s: number,
 ): void {
+  if (ax < 0 || ay < 0) return;
   ctx.drawImage(atlas, ax, ay, tileRes, tileRes, dx * s, dy * s, s, s);
 }
 

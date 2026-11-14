@@ -11,6 +11,7 @@ import { hashString, mulberry32 } from "./rng";
 import { isMatrixAutotile } from "./autotile";
 import { isStructureMode } from "./slice";
 import { DEFAULT_FRG_NOISE_CONFIG, noiseConfigFromTags } from "../terrainNoise";
+import { tilesetIdForPalette } from "./tilesets";
 
 // Within a role-distance tier the engine picks by style only, but it renders
 // each object by its OWN geometry — so a terrain-area object needs an auto-tile
@@ -163,6 +164,7 @@ function resolveDecoPalette(palettes: Palette[], role: string, style: string, se
 export function compileMap(map: LiteTileMap, pack: PackRuntime): Bindings {
   const out: Bindings = new Map();
   const byHash = new Map(pack.palettes.map((p) => [p.hash, p]));
+  const automaticPalettes = pack.palettes.filter((palette) => !palette.tilesetId);
   for (const o of eachObject(map)) {
     const role = roleOf(o);
     const override = o.tags["web.palette"] ? byHash.get(o.tags["web.palette"]) : undefined;
@@ -175,20 +177,21 @@ export function compileMap(map: LiteTileMap, pack: PackRuntime): Bindings {
       const pick = (hash?: string) => (hash ? byHash.get(hash) ?? null : null);
       // wall: explicit override → building/house_wall → fall back to the CLIFF body
       const wall = pick(h.wall)
-        ?? resolveSlotPalette(pack.palettes, "building/house_wall", style, seed ^ 0x11, PaletteMode.NINE_PATCH)
-        ?? resolveSlotPalette(pack.palettes, "building/house", style, seed ^ 0x13, PaletteMode.CLIFF);
+        ?? (tilesetIdForPalette(h.wall) ? null : resolveSlotPalette(automaticPalettes, "building/house_wall", style, seed ^ 0x11, PaletteMode.NINE_PATCH)
+          ?? resolveSlotPalette(automaticPalettes, "building/house", style, seed ^ 0x13, PaletteMode.CLIFF));
       const roof = pick(h.roof)
-        ?? resolveSlotPalette(pack.palettes, "building/house_roof", style, seed ^ 0x17, PaletteMode.NINE_PATCH);
+        ?? (tilesetIdForPalette(h.roof) ? null : resolveSlotPalette(automaticPalettes, "building/house_roof", style, seed ^ 0x17, PaletteMode.NINE_PATCH));
       const deco = h.decorations.map((decoration, i) => {
         const role = decorationRole(decoration.kind);
-        return pick(decoration.palette) ?? (role ? resolveDecoPalette(pack.palettes, role, style, seed ^ (0x20 + i)) : null);
+        return pick(decoration.palette) ?? (role && !tilesetIdForPalette(decoration.palette)
+          ? resolveDecoPalette(automaticPalettes, role, style, seed ^ (0x20 + i)) : null);
       });
       out.set(o.id, { kind: "house", wall, roof, deco });
       continue;
     }
 
     if (o.type === "FIXED_RECT_GROUP" && o.terrain) {
-      const frg = resolveFrgCells(o, byHash, pack.palettes);
+      const frg = resolveFrgCells(o, byHash, automaticPalettes);
       const noise = noiseConfigFromTags(o.tags, "web.frg", DEFAULT_FRG_NOISE_CONFIG);
       if (frg.explicit) {
         out.set(o.id, {
@@ -206,7 +209,8 @@ export function compileMap(map: LiteTileMap, pack: PackRuntime): Bindings {
       });
       continue;
     }
-    const palette = override ?? resolvePaletteForRole(pack.palettes, role, style, seed, o.type);
+    const palette = override ?? (tilesetIdForPalette(o.tags["web.palette"])
+      ? null : resolvePaletteForRole(automaticPalettes, role, style, seed, o.type));
     if (!palette) continue;
     out.set(o.id, { kind: bindingKind(palette.mode), palette });
   }
