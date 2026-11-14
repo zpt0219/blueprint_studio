@@ -1,0 +1,385 @@
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { rectangle, type Selection } from "./selection";
+import { tilesetImage } from "./files";
+import type { WorldImages } from "./worldCards";
+import { drawTile, type Atlases } from "./draw";
+import { gridPosition, WORLD_DETAIL_COLORS, type Point, type Surface, type WorldMap, type WorldCard } from "./model";
+
+interface Props {
+  width: number;
+  height: number;
+  atlases: Atlases;
+  surfaces: Array<Surface | undefined>;
+  brushSize: number;
+  canPaint: boolean;
+  panKey: boolean;
+  onPaint: (from: Point, to: Point) => void;
+  onCommit: () => void;
+  world?: WorldMap;
+  focus?: Point;
+  jump?: { point?: Point };
+  onFocus?: (point: Point, picked?: boolean) => void;
+  onTestPoint?: (point: Point) => void;
+  selectArea?: boolean;
+  selection?: Selection | null;
+  onSelection?: (area: Selection) => void;
+  onMoveSelection?: (area: Selection, at: Point) => void;
+  selectCards?: boolean;
+  selectedCard?: string | null;
+  onSelectCard?: (id: string | null) => void;
+  onDragCard?: (id: string, x: number, z: number) => void;
+}
+
+type Gesture = { id: number } & (
+  { kind: "paint"; last: Point } | { kind: "pan"; x: number; y: number }
+  | { kind: "area"; start: Point } | { kind: "move-area"; start: Point; area: Selection; at: Point }
+  | { kind: "card"; card: string; start: Point; original: Point }
+);
+
+export default function MapCanvas({ width, height, atlases, surfaces, brushSize, canPaint, panKey, onPaint, onCommit, world, focus, jump, onFocus, onTestPoint, selectCards, selectedCard, onSelectCard, onDragCard, selectArea, selection, onSelection, onMoveSelection }: Props) {
+  const canvas = useRef<HTMLCanvasElement>(null);
+  const gesture = useRef<Gesture | null>(null);
+  const [viewport, setViewport] = useState({ width: 1, height: 1 });
+  const [view, setView] = useState({ zoom: 1, x: 0, y: 0 });
+  const [hover, setHover] = useState<Point | null>(null);
+  const [images, setImages] = useState<WorldImages>(new Map());
+  const textures = world?.textures;
+  const cards = useMemo(() => [...(world?.cards ?? [])].sort((a, b) => a.position[2] - b.position[2]), [world?.cards]);
+  const detailData = world?.details;
+  const originX = world?.origin[0], originZ = world?.origin[1], metres = world?.metresPerTile;
+  const details = useMemo(() => {
+    if (!detailData || originX === undefined || originZ === undefined || !metres) return;
+    const pixels = Math.min(16, Math.floor(4096 / Math.max(width, height)));
+    const image = document.createElement("canvas");
+    image.width = width * pixels;
+    image.height = height * pixels;
+    const ctx = image.getContext("2d")!;
+    ctx.scale(pixels / metres, pixels / metres);
+    ctx.translate(-originX, -originZ);
+    for (const { kind, vertices, triangles } of detailData) {
+      if (kind === "sea" || kind === "embers") continue;
+      ctx.fillStyle = kind === "building" ? "#786b5d" : WORLD_DETAIL_COLORS[kind];
+      // Fill small batches so dense, overlapping building triangles stay cheap to rasterize.
+      const batch = kind === "ice" || kind === "frost" ? triangles.length : 384;
+      for (let start = 0; start < triangles.length; start += batch) {
+        ctx.beginPath();
+        for (let i = start; i < Math.min(start + batch, triangles.length); i += 3) {
+          const a = triangles[i] * 3, b = triangles[i + 1] * 3, c = triangles[i + 2] * 3;
+          const ax = vertices[a], az = vertices[a + 2];
+          const bx = vertices[b], bz = vertices[b + 2];
+          const cx = vertices[c], cz = vertices[c + 2];
+          const area = (bx - ax) * (cz - az) - (cx - ax) * (bz - az);
+          if (area === 0) continue;
+          ctx.moveTo(ax, az);
+          ctx.lineTo(area > 0 ? bx : cx, area > 0 ? bz : cz);
+          ctx.lineTo(area > 0 ? cx : bx, area > 0 ? cz : bz);
+          ctx.closePath();
+        }
+        ctx.fill();
+      }
+    }
+    return image;
+  }, [detailData, originX, originZ, metres, width, height]);
+  function cardRect(card: WorldCard) {
+    const [x, z] = gridPosition(world!, card.position[0], card.position[2]);
+    const w = Math.max(8, card.size[0] / world!.metresPerTile * size);
+    const h = Math.max(8, card.size[1] / world!.metresPerTile * size);
+    return { x: left + x * size, y: top + z * size, w, h };
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all((textures ?? []).map(async texture => [texture.id, await tilesetImage(texture.png)] as const))
+      .then(entries => { if (!cancelled) setImages(new Map(entries)); })
+      .catch(() => { if (!cancelled) setImages(new Map()); });
+    return () => { cancelled = true; };
+  }, [textures]);
+  const fitted = Math.max(0.1, Math.min(32, (viewport.width - 40) / width, (viewport.height - 40) / height));
+  const size = fitted * view.zoom;
+  const left = (viewport.width - width * size) / 2 + view.x;
+  const top = (viewport.height - height * size) / 2 + view.y;
+
+  useEffect(() => {
+    const element = canvas.current!;
+    const observer = new ResizeObserver(([entry]) => {
+      setViewport({ width: entry.contentRect.width, height: entry.contentRect.height });
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!jump) return;
+    const zoom = jump.point ? 5 : 1;
+    setView({
+      zoom,
+      x: jump.point ? (width / 2 - jump.point[0]) * fitted * zoom : 0,
+      y: jump.point ? (height / 2 - jump.point[1]) * fitted * zoom : 0,
+    });
+  }, [jump, width, height, fitted]);
+
+  useEffect(() => {
+    if (!onFocus || viewport.width <= 1) return;
+    const x = Math.min(width - 1, Math.max(0, Math.floor(width / 2 - view.x / size)));
+    const y = Math.min(height - 1, Math.max(0, Math.floor(height / 2 - view.y / size)));
+    onFocus([x, y]);
+  }, [onFocus, view, size, width, height, viewport.width]);
+
+  useEffect(() => {
+    const element = canvas.current!;
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    const pixelWidth = Math.max(1, Math.round(viewport.width * ratio));
+    const pixelHeight = Math.max(1, Math.round(viewport.height * ratio));
+    if (element.width !== pixelWidth) element.width = pixelWidth;
+    if (element.height !== pixelHeight) element.height = pixelHeight;
+    const ctx = element.getContext("2d")!;
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    ctx.clearRect(0, 0, viewport.width, viewport.height);
+    ctx.imageSmoothingEnabled = false;
+    ctx.fillStyle = "#f4f1e8";
+    ctx.fillRect(left, top, width * size, height * size);
+    const x0 = Math.max(0, Math.floor(-left / size));
+    const y0 = Math.max(0, Math.floor(-top / size));
+    const x1 = Math.min(width, Math.ceil((viewport.width - left) / size));
+    const y1 = Math.min(height, Math.ceil((viewport.height - top) / size));
+    const pixelEdge = (value: number) => Math.round(value * ratio) / ratio;
+    for (let y = y0; y < y1; y++) {
+      const topEdge = pixelEdge(top + y * size);
+      const bottomEdge = pixelEdge(top + (y + 1) * size);
+      for (let x = x0; x < x1; x++) {
+        const surface = surfaces[y * width + x];
+        if (!surface) continue;
+        const leftEdge = pixelEdge(left + x * size);
+        const rightEdge = pixelEdge(left + (x + 1) * size);
+        for (const tile of [...surface.tiles, ...(surface.decorations ?? []).map(item => item.tile)]) {
+          drawTile(ctx, atlases, tile, leftEdge, topEdge, rightEdge - leftEdge, bottomEdge - topEdge);
+        }
+      }
+    }
+    if (details) ctx.drawImage(details, left, top, width * size, height * size);
+    ctx.strokeStyle = "rgba(35, 37, 30, 0.18)";
+    ctx.lineWidth = 1 / ratio;
+    ctx.strokeRect(left, top, width * size, height * size);
+    if (size >= 7) {
+      ctx.beginPath();
+      for (let x = x0; x <= x1; x++) {
+        ctx.moveTo(left + x * size, top);
+        ctx.lineTo(left + x * size, top + height * size);
+      }
+      for (let y = y0; y <= y1; y++) {
+        ctx.moveTo(left, top + y * size);
+        ctx.lineTo(left + width * size, top + y * size);
+      }
+      ctx.stroke();
+    }
+    if (world) {
+      if (size >= 5) {
+        ctx.fillStyle = "#26332ab5";
+        for (const proxy of world.proxies) {
+          const [x, y] = gridPosition(world, proxy.position[0] - proxy.size[0] / 2, proxy.position[2] - proxy.size[2] / 2);
+          ctx.fillRect(left + x * size, top + y * size,
+            proxy.size[0] / world.metresPerTile * size, proxy.size[2] / world.metresPerTile * size);
+        }
+      }
+      for (const card of cards) {
+        const rect = cardRect(card);
+        if (rect.x + rect.w / 2 < 0 || rect.x - rect.w / 2 > viewport.width
+          || rect.y + rect.h / 2 < 0 || rect.y - rect.h / 2 > viewport.height) continue;
+        const image = images.get(card.texture);
+        if (image && size >= 5) {
+          ctx.save();
+          ctx.translate(rect.x, rect.y);
+          ctx.scale(card.flipH ? -1 : 1, card.flipV ? -1 : 1);
+          ctx.drawImage(image, ...card.region, -rect.w / 2, -rect.h / 2, rect.w, rect.h);
+          ctx.restore();
+        } else {
+          ctx.beginPath();
+          ctx.arc(rect.x, rect.y, selectCards ? 2.5 : 1.5, 0, Math.PI * 2);
+          ctx.fillStyle = "#305539";
+          ctx.fill();
+        }
+        if (card.id && card.id === selectedCard) {
+          ctx.strokeStyle = "#fff";
+          ctx.lineWidth = 3;
+          ctx.strokeRect(rect.x - rect.w / 2 - 2, rect.y - rect.h / 2 - 2, rect.w + 4, rect.h + 4);
+          ctx.strokeStyle = "#a34d15";
+          ctx.lineWidth = 1.5;
+          ctx.strokeRect(rect.x - rect.w / 2 - 2, rect.y - rect.h / 2 - 2, rect.w + 4, rect.h + 4);
+        }
+      }
+      function mark(point: [number, number, number], color: string, radius: number) {
+        const [x, y] = gridPosition(world!, point[0], point[2]);
+        ctx.beginPath();
+        ctx.arc(left + x * size, top + y * size, radius, 0, Math.PI * 2);
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.strokeStyle = "#ffffff";
+        ctx.stroke();
+      }
+      for (const marker of world.markers) mark(marker.position, "#173e53", 3);
+      if (world.testPoint) mark(world.testPoint, "#bc4b23", 6);
+      if (focus) {
+        ctx.strokeStyle = "#134d54";
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(left + focus[0] * size, top + focus[1] * size, Math.max(4, size), Math.max(4, size));
+      }
+    }
+    if (selection && selectArea) {
+      ctx.fillStyle = "#21877822";
+      ctx.fillRect(left + selection.x * size, top + selection.y * size, selection.width * size, selection.height * size);
+      ctx.strokeStyle = "#126950"; ctx.lineWidth = 2; ctx.setLineDash([5, 3]);
+      ctx.strokeRect(left + selection.x * size, top + selection.y * size, selection.width * size, selection.height * size);
+      ctx.setLineDash([]);
+    }
+    if (hover && canPaint && !panKey) {
+      const radius = Math.floor(brushSize / 2);
+      const startX = Math.max(0, hover[0] - radius), startY = Math.max(0, hover[1] - radius);
+      const endX = Math.min(width, hover[0] + radius + 1), endY = Math.min(height, hover[1] + radius + 1);
+      ctx.strokeStyle = "#fff";
+      ctx.lineWidth = 3;
+      ctx.strokeRect(left + startX * size, top + startY * size, (endX - startX) * size, (endY - startY) * size);
+      ctx.strokeStyle = "#125d48";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(left + startX * size, top + startY * size, (endX - startX) * size, (endY - startY) * size);
+    }
+  }, [atlases, surfaces, viewport, width, height, size, left, top, hover, brushSize, canPaint, panKey, world, focus, cards, details, images, selectedCard, selectCards, selection, selectArea]);
+
+  useEffect(() => {
+    const element = canvas.current!;
+    const wheel = (event: WheelEvent) => {
+      event.preventDefault();
+      const rect = element.getBoundingClientRect();
+      const x = event.clientX - rect.left - rect.width / 2;
+      const y = event.clientY - rect.top - rect.height / 2;
+      const delta = event.deltaY * (event.deltaMode === 1 ? 16 : 1);
+      setView(current => {
+        const zoom = Math.max(0.25, Math.min(12, current.zoom * Math.exp(-delta * 0.0014)));
+        const factor = zoom / current.zoom;
+        return { zoom, x: x - (x - current.x) * factor, y: y - (y - current.y) * factor };
+      });
+    };
+    element.addEventListener("wheel", wheel, { passive: false });
+    return () => element.removeEventListener("wheel", wheel);
+  }, []);
+
+  function precisePoint(event: ReactPointerEvent<HTMLCanvasElement>): Point {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return [(event.clientX - rect.left - left) / size, (event.clientY - rect.top - top) / size];
+  }
+
+  function point(event: ReactPointerEvent<HTMLCanvasElement>): Point {
+    const [x, z] = precisePoint(event);
+    return [Math.floor(x), Math.floor(z)];
+  }
+
+  function onDown(event: ReactPointerEvent<HTMLCanvasElement>) {
+    if (gesture.current || (event.button !== 0 && event.button !== 1)) return;
+    event.currentTarget.focus({ preventScroll: true });
+    if (panKey || event.button === 1) {
+      gesture.current = { kind: "pan", id: event.pointerId, x: event.clientX, y: event.clientY };
+    } else {
+      const tile = point(event);
+      if (tile[0] < 0 || tile[1] < 0 || tile[0] >= width || tile[1] >= height) return;
+      onFocus?.(tile, true);
+      if (event.shiftKey && onTestPoint) {
+        onTestPoint(precisePoint(event));
+        return;
+      }
+      if (selectArea) {
+        if (selection && tile[0] >= selection.x && tile[0] < selection.x + selection.width && tile[1] >= selection.y && tile[1] < selection.y + selection.height) {
+          gesture.current = { kind: "move-area", id: event.pointerId, start: tile, area: selection, at: [selection.x, selection.y] };
+        } else {
+          gesture.current = { kind: "area", id: event.pointerId, start: tile };
+          onSelection?.(rectangle(tile, tile));
+        }
+        event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); return;
+      }
+      if (selectCards && world) {
+        const bounds = event.currentTarget.getBoundingClientRect();
+        const mx = event.clientX - bounds.left, my = event.clientY - bounds.top;
+        let nearest: WorldCard | undefined;
+        let distance = Infinity;
+        for (const card of cards) {
+          if (!card.id) continue;
+          const rect = cardRect(card);
+          if (Math.abs(mx - rect.x) > Math.max(6, rect.w / 2)
+            || Math.abs(my - rect.y) > Math.max(6, rect.h / 2)) continue;
+          const d = Math.hypot(mx - rect.x, my - rect.y);
+          if (d < distance) { nearest = card; distance = d; }
+        }
+        onSelectCard?.(nearest?.id ?? null);
+        if (!nearest?.id) return;
+        gesture.current = {
+          kind: "card", id: event.pointerId, card: nearest.id, start: precisePoint(event),
+          original: [nearest.position[0], nearest.position[2]],
+        };
+        event.preventDefault();
+        event.currentTarget.setPointerCapture(event.pointerId);
+        return;
+      }
+      if (!canPaint) return;
+      gesture.current = { kind: "paint", id: event.pointerId, last: tile };
+      onPaint(tile, tile);
+    }
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function onMove(event: ReactPointerEvent<HTMLCanvasElement>) {
+    const active = gesture.current;
+    if (active && active.id !== event.pointerId) return;
+    if (active?.kind === "pan") {
+      const dx = event.clientX - active.x, dy = event.clientY - active.y;
+      setView(current => ({ ...current, x: current.x + dx, y: current.y + dy }));
+      active.x = event.clientX;
+      active.y = event.clientY;
+      return;
+    }
+    if (active?.kind === "card" && world) {
+      const next = precisePoint(event);
+      onDragCard?.(active.card, active.original[0] + (next[0] - active.start[0]) * world.metresPerTile,
+        active.original[1] + (next[1] - active.start[1]) * world.metresPerTile);
+      return;
+    }
+    const tile = point(event);
+    if (active?.kind === "area" || active?.kind === "move-area") {
+      tile[0] = Math.max(0, Math.min(width - 1, tile[0]));
+      tile[1] = Math.max(0, Math.min(height - 1, tile[1]));
+      if (active.kind === "area") onSelection?.(rectangle(active.start, tile));
+      else {
+        active.at = [Math.max(0, Math.min(width - active.area.width, active.area.x + tile[0] - active.start[0])),
+          Math.max(0, Math.min(height - active.area.height, active.area.y + tile[1] - active.start[1]))];
+        onSelection?.({ ...active.area, x: active.at[0], y: active.at[1] });
+      }
+      return;
+    }
+    const inside = tile[0] >= 0 && tile[1] >= 0 && tile[0] < width && tile[1] < height;
+    setHover(current => {
+      if (!inside) return null;
+      return current?.[0] === tile[0] && current[1] === tile[1] ? current : tile;
+    });
+    if (active?.kind === "paint") {
+      tile[0] = Math.max(0, Math.min(width - 1, tile[0]));
+      tile[1] = Math.max(0, Math.min(height - 1, tile[1]));
+      if (tile[0] !== active.last[0] || tile[1] !== active.last[1]) {
+        onPaint(active.last, tile);
+        active.last = tile;
+      }
+    }
+  }
+
+  function onEnd(event: ReactPointerEvent<HTMLCanvasElement>) {
+    const active = gesture.current;
+    if (active?.id !== event.pointerId) return;
+    gesture.current = null;
+    if (active.kind === "move-area") {
+      if (event.type === "pointercancel") onSelection?.(active.area);
+      else onMoveSelection?.(active.area, active.at);
+    }
+    if (active.kind === "paint" || active.kind === "card") onCommit();
+  }
+
+  return <canvas ref={canvas} className={panKey ? "tm-map tm-pan" : "tm-map"} aria-label="2D 地图" tabIndex={0}
+    onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onEnd} onPointerCancel={onEnd}
+    onLostPointerCapture={onEnd} onPointerLeave={() => setHover(null)} />;
+}
