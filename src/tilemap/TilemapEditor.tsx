@@ -8,6 +8,7 @@ import MapCanvas from "./MapCanvas";
 import Materials from "./Materials";
 import { cardPosition, deleteCard, moveCard, cellReferences, gridPosition, makeMap, paint, paintElevation, resolveSurfaces, worldPosition, type Cell, type Palette, type Point, type TileMap } from "./model";
 import { mergePack, replaceTileset } from "./assets";
+import { applyAkBeachDesign, AK_COAST_LAYER_ID } from "./akBeachDesign";
 import { buildPortablePatch } from "./patchAssets";
 import { copySelection, clearSelection, moveSelection, pasteSelection, type Selection, type Clipboard } from "./selection";
 import { AK_PREVIEW_VERSION, AK_PROJECT_URL, worldPreviewSurfaces } from "./world";
@@ -47,19 +48,27 @@ export default function TilemapEditor() {
   const [selectedCard, setSelectedCard] = useState<string | null>(null);
   const [brushSize, setBrushSize] = useState(1);
   const [elevation, setElevation] = useState("3");
+  const [show3D, setShow3D] = useState(false);
   const [focus, setFocus] = useState<Point>();
   const [pointFocus, setPointFocus] = useState<Point>();
   const [jump, setJump] = useState<{ point?: Point }>();
   const [location, setLocation] = useState("");
-  const focusAt = useCallback((next: Point, picked = false) => {
-    if (picked) setPointFocus(undefined);
-    setFocus(previous => !picked && previous?.[0] === next[0] && previous?.[1] === next[1] ? previous : next);
+  const focusAt = useCallback((next: Point, precise = false) => {
+    if (precise) {
+      const tile: Point = [Math.floor(next[0]), Math.floor(next[1])];
+      setLocation("");
+      setPointFocus(previous => previous?.[0] === next[0] && previous?.[1] === next[1] ? previous : next);
+      setFocus(previous => previous?.[0] === tile[0] && previous?.[1] === tile[1] ? previous : tile);
+      return;
+    }
+    setFocus(previous => previous?.[0] === next[0] && previous?.[1] === next[1] ? previous : next);
   }, []);
+  const defaultFocus = useMemo<Point>(() => [Math.floor(map.width / 2) + 0.5, Math.floor(map.height / 2) + 0.5], [map.width, map.height]);
   const previewFocus = useMemo<Point | undefined>(() =>
-    pointFocus ?? (focus && [focus[0] + 0.5, focus[1] + 0.5]), [focus, pointFocus]);
+    pointFocus ?? (focus ? [focus[0] + 0.5, focus[1] + 0.5] : (map.world || show3D ? defaultFocus : undefined)),
+  [pointFocus, focus, map.world, show3D, defaultFocus]);
   const focusedTile = useMemo<Point | undefined>(() =>
-    pointFocus ? [Math.floor(pointFocus[0]), Math.floor(pointFocus[1])] : focus, [focus, pointFocus]);
-  const [show3D, setShow3D] = useState(false);
+    previewFocus ? [Math.floor(previewFocus[0]), Math.floor(previewFocus[1])] : focus, [previewFocus, focus]);
   const [panKey, setPanKey] = useState(false);
   const [modal, setModal] = useState<Modal | null>(null);
   const [busy, setBusy] = useState(false);
@@ -251,14 +260,17 @@ export default function TilemapEditor() {
     const world = document.world;
     if (world?.id !== "ak-world-v1") return document;
     const hasCardIds = world.cards?.every(card => !!card.id);
-    if (hasCardIds && world.previewVersion === AK_PREVIEW_VERSION && world.terrain && world.wallColliders) return document;
+    const hasCoastDesign = document.layers.some(layer => layer.id === AK_COAST_LAYER_ID);
+    if (hasCardIds && hasCoastDesign && world.previewVersion === AK_PREVIEW_VERSION && world.terrain && world.wallColliders) {
+      return document;
+    }
     try {
       const source = await readAkProject();
       const original = source.world;
       if (original && original.revision === world.revision && source.width === document.width
         && source.height === document.height && original.metresPerTile === world.metresPerTile
         && original.origin.every((value, index) => value === world.origin[index])) {
-        return { ...document, world: { ...world,
+        return applyAkBeachDesign({ ...document, world: { ...world,
           cards: hasCardIds ? world.cards : world.cards?.map((card, i) => ({
             ...card, id: card.id ?? original.cards?.[i]?.id, name: card.name ?? original.cards?.[i]?.name,
           })) ?? original.cards,
@@ -268,21 +280,21 @@ export default function TilemapEditor() {
           terrain: original.terrain,
           lavaCells: original.lavaCells,
           wallColliders: original.wallColliders,
-          previewVersion: original.previewVersion,
+          previewVersion: AK_PREVIEW_VERSION,
           markers: [...world.markers, ...original.markers.filter(marker => !world.markers.some(old => old.id === marker.id))],
-        } };
+        } });
       }
     } catch {
       setNotice("AK 场景素材读取失败，可以稍后重新打开项目。");
     }
-    return document;
+    return applyAkBeachDesign(document);
   }
 
   async function openAkProject() {
     dismiss();
     setBusy(true);
     try {
-      reset(await readAkProject());
+      reset(await applyAkBeachDesign(await readAkProject()));
       setNotice("已打开 AK 室外大地图。");
     } catch (error) {
       setNotice(errorText(error));
@@ -394,7 +406,9 @@ export default function TilemapEditor() {
     const baseline = world.heights[index];
     const height = (surfaces[index]?.height ?? (world.elevations?.[index] ?? baseline) / world.metresPerTile)
       * world.metresPerTile;
-    setPointFocus(gridPosition(world, worldX, worldZ));
+    const nextFocus = gridPosition(world, worldX, worldZ);
+    setPointFocus(nextFocus);
+    setFocus([Math.floor(nextFocus[0]), Math.floor(nextFocus[1])]);
     const nativeHeight = world.terrain && Math.abs(height - baseline) < 0.0005
       ? await terrainHeightAt(world.terrain, worldX, worldZ).catch(() => undefined) : undefined;
     if (request !== pointRequest.current) return;
@@ -440,7 +454,7 @@ export default function TilemapEditor() {
       <section className="tm-editor" aria-label="地图编辑区">
         <MapCanvas key={`map-${revision}`} width={map.width} height={map.height} atlases={atlases} surfaces={previewSurfaces}
           brushSize={brushSize} canPaint={!busy && tool !== "area" && tool !== "select" && (tool === "elevation" || (activeLayer.visible && (tool === "eraser" || !!brush)))} panKey={panKey}
-          onPaint={draw} onCommit={() => dispatch({ type: "finish" })} world={world} focus={focusedTile} jump={jump}
+          onPaint={draw} onCommit={() => dispatch({ type: "finish" })} world={world} focus={world || show3D ? previewFocus : undefined} jump={jump}
           onFocus={world || show3D ? focusAt : undefined} onTestPoint={world && !busy ? setTestPoint : undefined}
           selectArea={!busy && tool === "area"} selection={selection} onSelection={setSelection}
           onMoveSelection={(area, at) => {
@@ -448,7 +462,8 @@ export default function TilemapEditor() {
             edit(current => moveSelection(current, activeLayer.id, area, at));
           }}
           selectCards={!busy && tool === "select"} selectedCard={selectedCard} onSelectCard={setSelectedCard}
-          onDragCard={(id, x, z) => dispatch({ type: "stroke", apply: current => moveCard(current, id, x, z) })} />
+          onDragCard={(id, x, z) => dispatch({ type: "stroke", apply: current => moveCard(current, id, x, z) })}
+          showElevation={tool === "elevation"} />
         <div className="tm-tools">
           <button type="button" aria-pressed={tool === "brush"} title="画笔 (B)" onClick={() => setTool("brush")}>画笔</button>
           <button type="button" aria-pressed={tool === "eraser"} title="橡皮 (E)" onClick={() => setTool("eraser")}>橡皮</button>
@@ -471,8 +486,10 @@ export default function TilemapEditor() {
           const marker = world.markers.find(item => item.id === id);
           const point = marker && gridPosition(world, marker.position[0], marker.position[2]);
           setLocation(id);
-          setPointFocus(point);
-          if (point) setFocus([Math.floor(point[0]), Math.floor(point[1])]);
+          if (point) {
+            setPointFocus(point);
+            setFocus([Math.floor(point[0]), Math.floor(point[1])]);
+          }
           setJump({ point });
         }}>
           <option value="" disabled>定位到…</option>
@@ -492,7 +509,7 @@ export default function TilemapEditor() {
         </div>
       </section>
       {show3D && <Suspense fallback={<div className="tm-preview tm-loading">正在打开 3D 预览…</div>}>
-        <MapPreview key={revision} width={map.width} height={map.height} atlases={atlases} surfaces={previewSurfaces} world={world} focus={previewFocus} />
+        <MapPreview key={revision} width={map.width} height={map.height} atlases={atlases} surfaces={previewSurfaces} world={world} focus={previewFocus} onFocus={point => focusAt(point, true)} />
       </Suspense>}
     </main>
 

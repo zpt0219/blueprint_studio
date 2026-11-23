@@ -123,13 +123,24 @@ export function buildMesh(surfaces: Array<Surface | undefined>, width: number, h
     });
     group.add(new THREE.Mesh(quads.geometry(), material));
   }
+  const decorationMaterials = new Map<string, THREE.MeshLambertMaterial>();
   surfaces.forEach((surface, index) => {
     for (const decoration of surface?.decorations ?? []) {
-      const pixels = atlases.get(decoration.tile.tileset)?.tileSize ?? 16;
-      const canvas = document.createElement("canvas"); canvas.width = canvas.height = pixels;
-      drawTile(canvas.getContext("2d")!, atlases, decoration.tile, 0, 0, pixels);
-      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(...decoration.size),
-        new THREE.MeshLambertMaterial({ map: makeTexture(canvas), side: THREE.DoubleSide, alphaTest: 0.5 }));
+      const key = `${decoration.tile.tileset}:${decoration.tile.x}:${decoration.tile.y}`;
+      let material = decorationMaterials.get(key);
+      if (!material) {
+        const pixels = atlases.get(decoration.tile.tileset)?.tileSize ?? 16;
+        const canvas = document.createElement("canvas"); canvas.width = canvas.height = pixels;
+        drawTile(canvas.getContext("2d")!, atlases, decoration.tile, 0, 0, pixels);
+        const texture = makeTexture(canvas);
+        if (pixels > 32) {
+          texture.magFilter = THREE.LinearFilter;
+          texture.minFilter = THREE.LinearFilter;
+        }
+        material = new THREE.MeshLambertMaterial({ map: texture, side: THREE.DoubleSide, alphaTest: 0.42 });
+        decorationMaterials.set(key, material);
+      }
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(...decoration.size), material);
       const x = index % width + 0.5, z = Math.floor(index / width) + 0.5;
       mesh.position.set(x, (native && !native.hasReplacement(index) ? native.heightAt(x, z) : undefined) ?? surface!.height, z);
       mesh.position.y += decoration.size[1] / 2;

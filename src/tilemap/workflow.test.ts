@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { makeMap, makeLayer, paint, resolveSurfaces, type Palette, type Tileset } from "./model";
 import { clearSelection, copySelection, moveSelection, pasteSelection } from "./selection";
 import { mergePack, replaceTileset } from "./assets";
+import { applyAkBeachDesign, AK_COAST_LAYER_ID, AK_COAST_TILESET_ID } from "./akBeachDesign";
 import { buildWorldPatch } from "./world";
 import { changeHistory, makeHistory } from "./history";
 
@@ -77,5 +78,35 @@ describe("editing workflow", () => {
     expect(surface.height).toBe(0.75);
     expect(surface.tiles).toHaveLength(1);
     expect(surface.decorations).toEqual([{ tile: { tileset: "custom", x: 16, y: 32 }, size: [1, 2], blocked: true }]);
+  });
+
+  it("applies the AK beach design with roads, oases, rocky reefs, and coastal decorations", async () => {
+    const base = makeMap(200, 160);
+    base.layers = [
+      { id: "ak-ground", name: "地面", visible: true, cells: {} },
+      { id: "ak-roads", name: "道路", visible: true, cells: {} },
+    ];
+    base.palettes = [
+      { id: "grass", name: "草地", tileset: asset.id, mode: "single", tiles: [[0, 0]], height: 0 },
+      { id: "sand", name: "沙地", tileset: asset.id, mode: "single", tiles: [[16, 0]], height: 0 },
+      { id: "rock", name: "岩地", tileset: asset.id, mode: "single", tiles: [[32, 0]], height: 0 },
+      { id: "road", name: "道路", tileset: asset.id, mode: "single", tiles: [[48, 0]], height: 0 },
+    ];
+    base.world = {
+      id: "ak-world-v1", revision: "test", origin: [-400, -320], metresPerTile: 4,
+      heights: Array(200 * 160).fill(1), markers: [], proxies: [],
+    };
+    const designed = await applyAkBeachDesign(base);
+    expect(designed.tilesets.some(item => item.id === AK_COAST_TILESET_ID)).toBe(true);
+    const decoLayer = designed.layers.find(item => item.id === AK_COAST_LAYER_ID);
+    expect(decoLayer).toBeDefined();
+    expect(Object.keys(decoLayer!.cells).length).toBeGreaterThan(280);
+    expect(Object.keys(designed.layers[1].cells).length).toBeGreaterThan(350);
+    expect(Object.keys(designed.layers[0].cells).length).toBeGreaterThan(500);
+    expect(designed.layers[0].cells[86 * 200 + 114]).toEqual({ palette: "ruin-altar-rune" });
+    expect(designed.world?.elevations?.[86 * 200 + 114]).toBe(3.7);
+    const patch = buildWorldPatch(designed, base);
+    expect(patch.changes.length).toBeGreaterThan(800);
+    expect(patch.elevations.length).toBeGreaterThan(120);
   });
 });

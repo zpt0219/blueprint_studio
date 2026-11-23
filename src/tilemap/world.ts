@@ -1,7 +1,7 @@
 import { type Cell, type TileMap, type WorldMap, type WorldPoint, WORLD_DETAIL_COLORS, resolveSurfaces, cardPosition, gridPosition, worldPosition } from "./model";
 
 export const AK_PROJECT_URL = `${import.meta.env.BASE_URL}sample/ak-world.bptilemap`;
-export const AK_PREVIEW_VERSION = 2;
+export const AK_PREVIEW_VERSION = 5;
 
 export function readWorld(value: unknown, width: number, height: number): WorldMap {
   const finite = (number: unknown) => typeof number === "number" && Number.isFinite(number);

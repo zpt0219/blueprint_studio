@@ -17,6 +17,7 @@ interface Props {
   surfaces: Array<Surface | undefined>;
   world?: WorldMap;
   focus?: Point;
+  onFocus?: (point: Point) => void;
 }
 
 interface Preview {
@@ -27,11 +28,15 @@ interface Preview {
 
 const movementKeys = new Set(["KeyW", "KeyA", "KeyS", "KeyD", "ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight"]);
 
-export default function MapPreview({ width, height, atlases, surfaces, world, focus }: Props) {
+export default function MapPreview({ width, height, atlases, surfaces, world, focus, onFocus }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const scenePane = useRef<HTMLDivElement>(null);
   const gamePane = useRef<HTMLDivElement>(null);
   const preview = useRef<Preview | null>(null);
+  const onFocusRef = useRef(onFocus);
+  onFocusRef.current = onFocus;
+  const initialFocus = useRef(focus);
+  initialFocus.current = focus;
   const [error, setError] = useState(false);
   const [imageError, setImageError] = useState(false);
   const [terrainError, setTerrainError] = useState(false);
@@ -104,7 +109,16 @@ export default function MapPreview({ width, height, atlases, surfaces, world, fo
     hiddenPlayer.layers.set(1);
     hiddenPlayer.renderOrder = 100;
     scene.add(hiddenPlayer);
-    const feet = new THREE.Vector3(width / 2, 0, height / 2);
+    const markRadius = Math.max(0.35, extent * 0.008);
+    const markHeight = Math.max(0.9, extent * 0.022);
+    const playerMark = new THREE.Mesh(
+      new THREE.CylinderGeometry(markRadius * 0.35, markRadius, markHeight, 12),
+      new THREE.MeshBasicMaterial({ color: "#e11d48" }),
+    );
+    playerMark.layers.set(2);
+    scene.add(playerMark);
+    const start = initialFocus.current ?? [Math.floor(width / 2) + 0.5, Math.floor(height / 2) + 0.5];
+    const feet = new THREE.Vector3(start[0], 0, start[1]);
 
     let frame: number | null = null;
     let pending: { surfaces: Array<Surface | undefined>; atlases: Atlases } | undefined;
@@ -213,14 +227,19 @@ export default function MapPreview({ width, height, atlases, surfaces, world, fo
         const step = 6 / metres * elapsed / Math.max(1, Math.hypot(x, z));
         const moveX = THREE.MathUtils.clamp(feet.x + x * step, 0.01, width - 0.01);
         const moveZ = THREE.MathUtils.clamp(feet.z + z * step, 0.01, height - 0.01);
+        const prevX = feet.x, prevZ = feet.z;
         if (canWalk([feet.x, feet.z], [moveX, feet.z], metres, heightAt, blockedAt)) feet.x = moveX;
         if (canWalk([feet.x, feet.z], [feet.x, moveZ], metres, heightAt, blockedAt)) feet.z = moveZ;
+        if (feet.x !== prevX || feet.z !== prevZ) {
+          onFocusRef.current?.([Number(feet.x.toFixed(3)), Number(feet.z.toFixed(3))]);
+        }
         lastMove = now;
         render();
       }
       feet.y = heightAt(feet.x, feet.z) ?? 0;
       player.position.set(feet.x, feet.y + 0.8 / metres, feet.z);
       hiddenPlayer.position.copy(player.position);
+      playerMark.position.set(feet.x, feet.y + markHeight / 2, feet.z);
       gameCamera.position.copy(feet).add(followOffset);
       if (testMark) {
         const floorY = heightAt(testMark.position.x, testMark.position.z);
@@ -310,8 +329,15 @@ export default function MapPreview({ width, height, atlases, surfaces, world, fo
         render();
       },
       locatePlayer(x, z) {
+        if (Math.abs(feet.x - x) < 0.0006 && Math.abs(feet.z - z) < 0.0006) return;
+        const dx = x - feet.x;
+        const dz = z - feet.z;
         feet.x = x;
         feet.z = z;
+        if (hasFlown) {
+          camera.position.x += dx;
+          camera.position.z += dz;
+        }
         render();
       },
       decorate(world, images) {
@@ -405,6 +431,8 @@ export default function MapPreview({ width, height, atlases, surfaces, world, fo
       player.geometry.dispose();
       player.material.dispose();
       hiddenPlayer.material.dispose();
+      playerMark.geometry.dispose();
+      playerMark.material.dispose();
       floor.geometry.dispose();
       floor.material.dispose();
       grid.geometry.dispose();

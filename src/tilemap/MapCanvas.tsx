@@ -28,20 +28,23 @@ interface Props {
   selectedCard?: string | null;
   onSelectCard?: (id: string | null) => void;
   onDragCard?: (id: string, x: number, z: number) => void;
+  showElevation?: boolean;
 }
 
 type Gesture = { id: number } & (
   { kind: "paint"; last: Point } | { kind: "pan"; x: number; y: number }
   | { kind: "area"; start: Point } | { kind: "move-area"; start: Point; area: Selection; at: Point }
   | { kind: "card"; card: string; start: Point; original: Point }
+  | { kind: "focus" }
 );
 
-export default function MapCanvas({ width, height, atlases, surfaces, brushSize, canPaint, panKey, onPaint, onCommit, world, focus, jump, onFocus, onTestPoint, selectCards, selectedCard, onSelectCard, onDragCard, selectArea, selection, onSelection, onMoveSelection }: Props) {
+export default function MapCanvas({ width, height, atlases, surfaces, brushSize, canPaint, panKey, onPaint, onCommit, world, focus, jump, onFocus, onTestPoint, selectCards, selectedCard, onSelectCard, onDragCard, selectArea, selection, onSelection, onMoveSelection, showElevation }: Props) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const gesture = useRef<Gesture | null>(null);
   const [viewport, setViewport] = useState({ width: 1, height: 1 });
   const [view, setView] = useState({ zoom: 1, x: 0, y: 0 });
   const [hover, setHover] = useState<Point | null>(null);
+  const [hoverFocus, setHoverFocus] = useState(false);
   const [images, setImages] = useState<WorldImages>(new Map());
   const textures = world?.textures;
   const cards = useMemo(() => [...(world?.cards ?? [])].sort((a, b) => a.position[2] - b.position[2]), [world?.cards]);
@@ -80,6 +83,136 @@ export default function MapCanvas({ width, height, atlases, surfaces, brushSize,
     }
     return image;
   }, [detailData, originX, originZ, metres, width, height]);
+
+  const relief = useMemo(() => {
+    const scale = metres ?? 4;
+    let hasElevation = false;
+    for (const s of surfaces) {
+      if (s && s.height !== 0) { hasElevation = true; break; }
+    }
+    if (!hasElevation) return;
+    const cell = Math.min(12, Math.max(8, Math.floor(2400 / Math.max(width, height))));
+    const image = document.createElement("canvas");
+    image.width = width * cell;
+    image.height = height * cell;
+    const ctx = image.getContext("2d");
+    if (!ctx) return;
+
+    const heightAt = (x: number, y: number): number | undefined => {
+      if (x < 0 || y < 0 || x >= width || y >= height) return undefined;
+      const s = surfaces[y * width + x];
+      if (!s) return undefined;
+      const h = s.height * scale;
+      return world && h <= -1.5 ? undefined : h;
+    };
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const h = heightAt(x, y);
+        if (h === undefined) continue;
+        const px = x * cell, py = y * cell;
+
+        // 1. Hypsometric height darkening: higher elevations get deeper tone
+        if (h > 1.5) {
+          const baseNorm = Math.min(1, Math.max(0, (h - 2.0) / 24.0));
+          const subStep = h > 3.0 && h < 6.0 ? ((h - 3.0) / 3.0) * 0.08 : 0;
+          const alpha = Math.min(0.42, Math.round(baseNorm * 16) / 16 * 0.38 + subStep);
+          if (alpha > 0.01) {
+            ctx.fillStyle = `rgba(16, 24, 30, ${alpha.toFixed(3)})`;
+            ctx.fillRect(px, py, cell, cell);
+          }
+        }
+
+        const hN = heightAt(x, y - 1) ?? h;
+        const hS = heightAt(x, y + 1) ?? h;
+        const hW = heightAt(x - 1, y) ?? h;
+        const hE = heightAt(x + 1, y) ?? h;
+
+        // 2. Walkable ramp / stair slope detection & tread stripes
+        const rampNS = (hN > h + 0.18 && h > hS + 0.18 && hN - h <= 2.8 && h - hS <= 2.8)
+          || (hS > h + 0.18 && h > hN + 0.18 && hS - h <= 2.8 && h - hN <= 2.8);
+        const rampEW = !rampNS && ((hW > h + 0.18 && h > hE + 0.18 && hW - h <= 2.8 && h - hE <= 2.8)
+          || (hE > h + 0.18 && h > hW + 0.18 && hE - h <= 2.8 && h - hW <= 2.8));
+
+        if (rampNS) {
+          for (let ty = 2; ty <= cell - 3; ty += 3) {
+            ctx.fillStyle = "rgba(255, 252, 238, 0.42)";
+            ctx.fillRect(px + 1, py + ty, cell - 2, 1);
+            ctx.fillStyle = "rgba(18, 24, 28, 0.48)";
+            ctx.fillRect(px + 1, py + ty + 1, cell - 2, 1);
+          }
+        } else if (rampEW) {
+          for (let tx = 2; tx <= cell - 3; tx += 3) {
+            ctx.fillStyle = "rgba(255, 252, 238, 0.42)";
+            ctx.fillRect(px + tx, py + 1, 1, cell - 2);
+            ctx.fillStyle = "rgba(18, 24, 28, 0.48)";
+            ctx.fillRect(px + tx + 1, py + 1, 1, cell - 2);
+          }
+        }
+
+        // 3. Cliff contour edges, northwest sunlit rim highlights & southeast drop shadows
+        const dhN = h - hN, dhW = h - hW, dhS = h - hS, dhE = h - hE;
+
+        if (dhN > 0.12 && !(rampNS && dhN <= 2.8)) {
+          if (dhN > 0.36) {
+            const sev = Math.min(1, (dhN - 0.36) / 6.0);
+            ctx.fillStyle = `rgba(20, 26, 30, ${(0.55 + sev * 0.3).toFixed(2)})`;
+            ctx.fillRect(px, py, cell, 1);
+            ctx.fillStyle = `rgba(255, 252, 235, ${(0.45 + sev * 0.35).toFixed(2)})`;
+            ctx.fillRect(px, py + 1, cell, 1.5);
+          } else {
+            ctx.fillStyle = "rgba(255, 252, 235, 0.48)";
+            ctx.fillRect(px, py, cell, 1);
+          }
+        }
+        if (dhW > 0.12 && !(rampEW && dhW <= 2.8)) {
+          if (dhW > 0.36) {
+            const sev = Math.min(1, (dhW - 0.36) / 6.0);
+            ctx.fillStyle = `rgba(20, 26, 30, ${(0.55 + sev * 0.3).toFixed(2)})`;
+            ctx.fillRect(px, py, 1, cell);
+            ctx.fillStyle = `rgba(255, 252, 235, ${(0.45 + sev * 0.35).toFixed(2)})`;
+            ctx.fillRect(px + 1, py, 1.5, cell);
+          } else {
+            ctx.fillStyle = "rgba(255, 252, 235, 0.48)";
+            ctx.fillRect(px, py, 1, cell);
+          }
+        }
+        if (dhS > 0.12 && !(rampNS && dhS <= 2.8)) {
+          if (dhS > 0.36) {
+            const sev = Math.min(1, (dhS - 0.36) / 6.0);
+            const band = dhS > 2.5 ? 2 : 1.5;
+            ctx.fillStyle = `rgba(16, 20, 24, ${(0.68 + sev * 0.25).toFixed(2)})`;
+            ctx.fillRect(px, py + cell - band, cell, band);
+            if (y + 1 < height) {
+              const sh = dhS > 2.5 ? 3 : 2;
+              ctx.fillStyle = `rgba(14, 20, 26, ${(0.24 + sev * 0.2).toFixed(2)})`;
+              ctx.fillRect(px, py + cell, cell, sh);
+            }
+          } else {
+            ctx.fillStyle = "rgba(20, 26, 30, 0.52)";
+            ctx.fillRect(px, py + cell - 1, cell, 1);
+          }
+        }
+        if (dhE > 0.12 && !(rampEW && dhE <= 2.8)) {
+          if (dhE > 0.36) {
+            const sev = Math.min(1, (dhE - 0.36) / 6.0);
+            const band = dhE > 2.5 ? 2 : 1.5;
+            ctx.fillStyle = `rgba(16, 20, 24, ${(0.68 + sev * 0.25).toFixed(2)})`;
+            ctx.fillRect(px + cell - band, py, band, cell);
+            if (x + 1 < width) {
+              const sh = dhE > 2.5 ? 3 : 2;
+              ctx.fillStyle = `rgba(14, 20, 26, ${(0.24 + sev * 0.2).toFixed(2)})`;
+              ctx.fillRect(px + cell, py, sh, cell);
+            }
+          } else {
+            ctx.fillStyle = "rgba(20, 26, 30, 0.52)";
+            ctx.fillRect(px + cell - 1, py, 1, cell);
+          }
+        }
+      }
+    }
+    return image;
+  }, [surfaces, width, height, metres, world]);
   function cardRect(card: WorldCard) {
     const [x, z] = gridPosition(world!, card.position[0], card.position[2]);
     const w = Math.max(8, card.size[0] / world!.metresPerTile * size);
@@ -119,13 +252,6 @@ export default function MapCanvas({ width, height, atlases, surfaces, brushSize,
   }, [jump, width, height, fitted]);
 
   useEffect(() => {
-    if (!onFocus || viewport.width <= 1) return;
-    const x = Math.min(width - 1, Math.max(0, Math.floor(width / 2 - view.x / size)));
-    const y = Math.min(height - 1, Math.max(0, Math.floor(height / 2 - view.y / size)));
-    onFocus([x, y]);
-  }, [onFocus, view, size, width, height, viewport.width]);
-
-  useEffect(() => {
     const element = canvas.current!;
     const ratio = Math.min(window.devicePixelRatio || 1, 2);
     const pixelWidth = Math.max(1, Math.round(viewport.width * ratio));
@@ -151,12 +277,37 @@ export default function MapCanvas({ width, height, atlases, surfaces, brushSize,
         if (!surface) continue;
         const leftEdge = pixelEdge(left + x * size);
         const rightEdge = pixelEdge(left + (x + 1) * size);
-        for (const tile of [...surface.tiles, ...(surface.decorations ?? []).map(item => item.tile)]) {
+        for (const tile of surface.tiles) {
           drawTile(ctx, atlases, tile, leftEdge, topEdge, rightEdge - leftEdge, bottomEdge - topEdge);
         }
       }
     }
+    if (relief) ctx.drawImage(relief, left, top, width * size, height * size);
     if (details) ctx.drawImage(details, left, top, width * size, height * size);
+    if ((showElevation && size >= 12) || size >= 28) {
+      const scale = metres ?? 1;
+      ctx.save();
+      ctx.font = `600 ${Math.min(12, Math.max(9, Math.floor(size * 0.34)))}px system-ui, sans-serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      for (let y = y0; y < y1; y++) {
+        for (let x = x0; x < x1; x++) {
+          const s = surfaces[y * width + x];
+          if (!s) continue;
+          const h = s.height * scale;
+          if (world && h <= -1.5) continue;
+          if (!showElevation && h === 0) continue;
+          const label = Number.isInteger(Number(h.toFixed(1))) ? `${Math.round(h)}` : `${Number(h.toFixed(2))}`;
+          const cx = left + (x + 0.5) * size, cy = top + (y + 0.5) * size;
+          ctx.strokeStyle = "rgba(20, 28, 24, 0.78)";
+          ctx.lineWidth = 2.5;
+          ctx.strokeText(label, cx, cy);
+          ctx.fillStyle = "#f7faf7";
+          ctx.fillText(label, cx, cy);
+        }
+      }
+      ctx.restore();
+    }
     ctx.strokeStyle = "rgba(35, 37, 30, 0.18)";
     ctx.lineWidth = 1 / ratio;
     ctx.strokeRect(left, top, width * size, height * size);
@@ -171,6 +322,26 @@ export default function MapCanvas({ width, height, atlases, surfaces, brushSize,
         ctx.lineTo(left + width * size, top + y * size);
       }
       ctx.stroke();
+    }
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        const decorations = surfaces[y * width + x]?.decorations;
+        if (!decorations?.length) continue;
+        const cx = left + (x + 0.5) * size;
+        const cy = top + (y + 0.5) * size;
+        for (const decoration of decorations) {
+          if (!world || size >= 5) {
+            const w = Math.max(8, decoration.size[0] * size);
+            const h = Math.max(8, decoration.size[1] * size);
+            drawTile(ctx, atlases, decoration.tile, cx - w / 2, cy - h / 2, w, h);
+          } else {
+            ctx.beginPath();
+            ctx.arc(cx, cy, 1.5, 0, Math.PI * 2);
+            ctx.fillStyle = "#305539";
+            ctx.fill();
+          }
+        }
+      }
     }
     if (world) {
       if (size >= 5) {
@@ -218,11 +389,6 @@ export default function MapCanvas({ width, height, atlases, surfaces, brushSize,
       }
       for (const marker of world.markers) mark(marker.position, "#173e53", 3);
       if (world.testPoint) mark(world.testPoint, "#bc4b23", 6);
-      if (focus) {
-        ctx.strokeStyle = "#134d54";
-        ctx.lineWidth = 1.5;
-        ctx.strokeRect(left + focus[0] * size, top + focus[1] * size, Math.max(4, size), Math.max(4, size));
-      }
     }
     if (selection && selectArea) {
       ctx.fillStyle = "#21877822";
@@ -231,7 +397,7 @@ export default function MapCanvas({ width, height, atlases, surfaces, brushSize,
       ctx.strokeRect(left + selection.x * size, top + selection.y * size, selection.width * size, selection.height * size);
       ctx.setLineDash([]);
     }
-    if (hover && canPaint && !panKey) {
+    if (hover && canPaint && !panKey && !hoverFocus) {
       const radius = Math.floor(brushSize / 2);
       const startX = Math.max(0, hover[0] - radius), startY = Math.max(0, hover[1] - radius);
       const endX = Math.min(width, hover[0] + radius + 1), endY = Math.min(height, hover[1] + radius + 1);
@@ -242,7 +408,46 @@ export default function MapCanvas({ width, height, atlases, surfaces, brushSize,
       ctx.lineWidth = 1;
       ctx.strokeRect(left + startX * size, top + startY * size, (endX - startX) * size, (endY - startY) * size);
     }
-  }, [atlases, surfaces, viewport, width, height, size, left, top, hover, brushSize, canPaint, panKey, world, focus, cards, details, images, selectedCard, selectCards, selection, selectArea]);
+    if (focus) {
+      const fx = left + focus[0] * size;
+      const fy = top + focus[1] * size;
+      if (size >= 6) {
+        const tx = left + Math.floor(focus[0]) * size;
+        const ty = top + Math.floor(focus[1]) * size;
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(tx, ty, size, size);
+      }
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(fx, fy, 12, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(255, 213, 120, 0.32)";
+      ctx.fill();
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "rgba(20, 35, 30, 0.65)";
+      ctx.stroke();
+      ctx.lineWidth = 1.75;
+      ctx.strokeStyle = "#ffd578";
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.arc(fx, fy, 6.5, 0, Math.PI * 2);
+      ctx.fillStyle = "#e11d48";
+      ctx.fill();
+      ctx.lineWidth = 3.5;
+      ctx.strokeStyle = "#14231e";
+      ctx.stroke();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "#ffffff";
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.arc(fx, fy, 2, 0, Math.PI * 2);
+      ctx.fillStyle = "#ffffff";
+      ctx.fill();
+      ctx.restore();
+    }
+  }, [atlases, surfaces, viewport, width, height, size, left, top, hover, hoverFocus, brushSize, canPaint, panKey, world, focus, cards, details, relief, showElevation, metres, images, selectedCard, selectCards, selection, selectArea]);
 
   useEffect(() => {
     const element = canvas.current!;
@@ -272,15 +477,32 @@ export default function MapCanvas({ width, height, atlases, surfaces, brushSize,
     return [Math.floor(x), Math.floor(z)];
   }
 
+  function hitFocus(event: ReactPointerEvent<HTMLCanvasElement>): boolean {
+    if (!focus || !onFocus) return false;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const mx = event.clientX - rect.left;
+    const my = event.clientY - rect.top;
+    return Math.hypot(mx - (left + focus[0] * size), my - (top + focus[1] * size)) <= 14;
+  }
+
+  function clampFocus([x, z]: Point): Point {
+    const clamp = (value: number, max: number) =>
+      Math.round(Math.max(0.01, Math.min(max - 0.01, value)) * 1000) / 1000;
+    return [clamp(x, width), clamp(z, height)];
+  }
+
   function onDown(event: ReactPointerEvent<HTMLCanvasElement>) {
     if (gesture.current || (event.button !== 0 && event.button !== 1)) return;
     event.currentTarget.focus({ preventScroll: true });
     if (panKey || event.button === 1) {
       gesture.current = { kind: "pan", id: event.pointerId, x: event.clientX, y: event.clientY };
+    } else if (!event.shiftKey && hitFocus(event)) {
+      gesture.current = { kind: "focus", id: event.pointerId };
+      setHover(null);
+      setHoverFocus(true);
     } else {
       const tile = point(event);
       if (tile[0] < 0 || tile[1] < 0 || tile[0] >= width || tile[1] >= height) return;
-      onFocus?.(tile, true);
       if (event.shiftKey && onTestPoint) {
         onTestPoint(precisePoint(event));
         return;
@@ -335,6 +557,10 @@ export default function MapCanvas({ width, height, atlases, surfaces, brushSize,
       active.y = event.clientY;
       return;
     }
+    if (active?.kind === "focus") {
+      onFocus?.(clampFocus(precisePoint(event)), true);
+      return;
+    }
     if (active?.kind === "card" && world) {
       const next = precisePoint(event);
       onDragCard?.(active.card, active.original[0] + (next[0] - active.start[0]) * world.metresPerTile,
@@ -352,6 +578,9 @@ export default function MapCanvas({ width, height, atlases, surfaces, brushSize,
         onSelection?.({ ...active.area, x: active.at[0], y: active.at[1] });
       }
       return;
+    }
+    if (!active) {
+      setHoverFocus(!panKey && hitFocus(event));
     }
     const inside = tile[0] >= 0 && tile[1] >= 0 && tile[0] < width && tile[1] < height;
     setHover(current => {
@@ -379,7 +608,7 @@ export default function MapCanvas({ width, height, atlases, surfaces, brushSize,
     if (active.kind === "paint" || active.kind === "card") onCommit();
   }
 
-  return <canvas ref={canvas} className={panKey ? "tm-map tm-pan" : "tm-map"} aria-label="2D 地图" tabIndex={0}
+  return <canvas ref={canvas} className={panKey || hoverFocus ? "tm-map tm-pan" : "tm-map"} aria-label="2D 地图" tabIndex={0}
     onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onEnd} onPointerCancel={onEnd}
-    onLostPointerCapture={onEnd} onPointerLeave={() => setHover(null)} />;
+    onLostPointerCapture={onEnd} onPointerLeave={() => { setHover(null); setHoverFocus(false); }} />;
 }
