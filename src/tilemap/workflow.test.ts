@@ -103,10 +103,32 @@ describe("editing workflow", () => {
     expect(Object.keys(decoLayer!.cells).length).toBeGreaterThan(280);
     expect(Object.keys(designed.layers[1].cells).length).toBeGreaterThan(350);
     expect(Object.keys(designed.layers[0].cells).length).toBeGreaterThan(500);
-    expect(designed.layers[0].cells[86 * 200 + 114]).toEqual({ palette: "ruin-altar-rune" });
-    expect(designed.world?.elevations?.[86 * 200 + 114]).toBe(3.7);
+    expect(designed.layers[0].cells[88 * 200 + 114]).toEqual({ palette: "ruin-altar-rune" });
+    expect(designed.world?.elevations?.[88 * 200 + 114]).toBe(3.9);
+    // SE Highlands follow the open, traversable 3.0..5.0m height curve synced with Godot.
+    const seHeights = Object.entries(designed.world?.elevations ?? {})
+      .filter(([key]) => Number(key) >= 22200)
+      .map(([, metres]) => metres);
+    expect(seHeights.length).toBeGreaterThan(1000);
+    expect(Math.max(...seHeights)).toBe(5);
     const patch = buildWorldPatch(designed, base);
     expect(patch.changes.length).toBeGreaterThan(800);
     expect(patch.elevations.length).toBeGreaterThan(120);
+
+    // Verify all 18 universal 2D->3D Scene Kit palettes are registered and preserve semantic palette IDs on export.
+    const expectedKitIds = [
+      "ruin-flagstone", "ruin-moss-stone", "ruin-altar-rune", "ruin-wall-block",
+      "ruin-pillar", "ruin-broken-pillar", "ruin-fallen-column", "ruin-stele",
+      "ruin-arch", "ruin-watchtower", "ruin-gate", "scene-mine-entrance",
+      "scene-stone-fence", "scene-wood-fence", "scene-brazier", "scene-lamp-post",
+      "scene-camp-tent", "scene-supply-crates", "scene-stone-well", "scene-signpost",
+    ];
+    const paletteIds = new Set(designed.palettes.map(p => p.id));
+    for (const id of expectedKitIds) {
+      expect(paletteIds.has(id)).toBe(true);
+    }
+    const withKit = paint(designed, AK_COAST_LAYER_ID, [10, 10], [10, 10], 1, { palette: "scene-camp-tent" });
+    const kitPatch = buildWorldPatch(withKit, base);
+    expect(kitPatch.changes.some(c => c.tile[0] === 10 && c.tile[1] === 10 && c.cell && "palette" in c.cell && c.cell.palette === "scene-camp-tent")).toBe(true);
   });
 });
