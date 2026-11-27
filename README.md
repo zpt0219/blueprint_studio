@@ -67,7 +67,7 @@ blueprint_studio/
 
 ## AK 室外大地图调试
 
-打开 Blueprint Studio，点「打开 AK 大地图」。旧工作台的入口是 `/?editor=legacy`。全图 200×160 格，每格 4 米。用「定位到」跳到地标，开启「3D 预览」后，上方默认显示全图。点击自由视角后，WASD 飞行，按住右键拖动转向，Shift 加速，Q/E 升降，F 回到全图。下方游戏视角跟随角色，点击后可用 WASD 移动。画笔改变素材，高程工具以米为单位写入绝对高度。Shift+点击记下测试落点。项目包用于继续编辑，「用于游戏 → 下载补丁」保存相对随附快照的格子差异及自定义贴图。
+打开 Blueprint Studio，点「打开 AK 大地图」（可选择含海滩、神殿废墟、东南沙漠高地与 3D 套件的 `public/sample/ak-world-designed.bptilemap`，或未修改的原始 Godot 基线快照 `public/sample/ak-world.bptilemap`；单独的海岸/神殿/3D 套件素材包位于 `public/sample/ak-coast-kit.bppalette`）。旧工作台的入口是 `/?editor=legacy`。全图 200×160 格，每格 4 米。用「定位到」跳到地标，开启「3D 预览」后，上方默认显示全图。点击自由视角后，WASD 飞行，按住右键拖动转向，Shift 加速，Q/E 升降，F 回到全图。下方游戏视角跟随角色，点击后可用 WASD 移动。画笔改变素材，高程工具以米为单位写入绝对高度。Shift+点击记下测试落点。项目包用于继续编辑，「用于游戏 → 下载补丁」保存相对原始 Godot 基线快照（`public/sample/ak-world.bptilemap`）的格子差异及自定义贴图。
 
 在 Blueprint Studio 根目录运行下列命令。默认读取同级的 `asterfell-scene` 及其已构建的 Godot Mono 环境。可用 `AK_PROJECT_DIR` 和 `GODOT_BIN` 指定位置。
 

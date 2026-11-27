@@ -8,10 +8,10 @@ import MapCanvas from "./MapCanvas";
 import Materials from "./Materials";
 import { cardPosition, deleteCard, moveCard, cellReferences, gridPosition, makeMap, paint, paintElevation, resolveSurfaces, worldPosition, type Cell, type Palette, type Point, type TileMap } from "./model";
 import { mergePack, replaceTileset } from "./assets";
-import { applyAkBeachDesign, AK_COAST_LAYER_ID } from "./akBeachDesign";
+import { hydrateAkSceneDetails, migrateLegacyAkDraft, needsAkSceneHydration, needsLegacyAkMigration, readAkDesignedProject } from "./akBeachDesign";
 import { buildPortablePatch } from "./patchAssets";
 import { copySelection, clearSelection, moveSelection, pasteSelection, type Selection, type Clipboard } from "./selection";
-import { AK_PREVIEW_VERSION, AK_PROJECT_URL, worldPreviewSurfaces } from "./world";
+import { AK_PROJECT_URL, worldPreviewSurfaces } from "./world";
 import { terrainHeightAt } from "./worldTerrainData";
 import "./tilemap.css";
 
@@ -110,10 +110,11 @@ export default function TilemapEditor() {
   useEffect(() => {
     let cancelled = false;
     readDraft().then(async saved => {
-      const draft = saved && await withAkSceneDetails(saved);
+      const draft = saved && await withAkSceneDetails(saved, { migrateDraft: true });
       if (!cancelled && draft) {
-        lastQueued.current = draft;
-        setSavedMap(draft);
+        const unchanged = draft === saved;
+        lastQueued.current = unchanged ? draft : saved;
+        setSavedMap(unchanged ? draft : undefined);
         dispatch({ type: "reset", map: draft });
         if (draft.palettes.some(palette => palette.tileset === draft.tilesets[0]?.id)) setMaterialsMode("palette");
       }
@@ -244,58 +245,61 @@ export default function TilemapEditor() {
     }
   }
 
-  async function readAkProject() {
-    if (import.meta.env.DEV) {
+  async function readLocalAkBaseline(): Promise<TileMap | undefined> {
+    if (!import.meta.env.DEV) return undefined;
+    try {
       const local = await fetch(`${import.meta.env.BASE_URL}ak-world.bptilemap.local`);
       if (local.ok && !local.headers.get("content-type")?.includes("text/html")) {
         return decodeProject(new Uint8Array(await local.arrayBuffer()));
       }
+    } catch {
+      // Fall back to the bundled baseline snapshot.
     }
+    return undefined;
+  }
+
+  async function readAkProject(): Promise<TileMap> {
+    const local = await readLocalAkBaseline();
+    if (local) return local;
     const response = await fetch(AK_PROJECT_URL);
     if (!response.ok) throw new Error("无法读取 AK 地图快照。");
     return decodeProject(new Uint8Array(await response.arrayBuffer()));
   }
 
-  async function withAkSceneDetails(document: TileMap): Promise<TileMap> {
-    const world = document.world;
-    if (world?.id !== "ak-world-v1") return document;
-    const hasCardIds = world.cards?.every(card => !!card.id);
-    const hasCoastDesign = document.layers.some(layer => layer.id === AK_COAST_LAYER_ID);
-    if (hasCardIds && hasCoastDesign && world.previewVersion === AK_PREVIEW_VERSION && world.terrain && world.wallColliders) {
-      return document;
-    }
-    try {
-      const source = await readAkProject();
-      const original = source.world;
-      if (original && original.revision === world.revision && source.width === document.width
-        && source.height === document.height && original.metresPerTile === world.metresPerTile
-        && original.origin.every((value, index) => value === world.origin[index])) {
-        return applyAkBeachDesign({ ...document, world: { ...world,
-          cards: hasCardIds ? world.cards : world.cards?.map((card, i) => ({
-            ...card, id: card.id ?? original.cards?.[i]?.id, name: card.name ?? original.cards?.[i]?.name,
-          })) ?? original.cards,
-          textures: world.textures ?? original.textures,
-          proxies: original.proxies,
-          details: original.details ?? world.details,
-          terrain: original.terrain,
-          lavaCells: original.lavaCells,
-          wallColliders: original.wallColliders,
-          previewVersion: AK_PREVIEW_VERSION,
-          markers: [...world.markers, ...original.markers.filter(marker => !world.markers.some(old => old.id === marker.id))],
-        } });
+  async function withAkSceneDetails(document: TileMap, options?: { migrateDraft?: boolean }): Promise<TileMap> {
+    if (document.world?.id !== "ak-world-v1") return document;
+    let current = document;
+    if (needsAkSceneHydration(current)) {
+      try {
+        current = hydrateAkSceneDetails(current, await readAkProject());
+      } catch {
+        setNotice("AK 场景素材读取失败，可以稍后重新打开项目。");
       }
-    } catch {
-      setNotice("AK 场景素材读取失败，可以稍后重新打开项目。");
     }
-    return applyAkBeachDesign(document);
+    if (options?.migrateDraft && needsLegacyAkMigration(current)) {
+      try {
+        current = migrateLegacyAkDraft(current, await readAkDesignedProject());
+      } catch {
+        setNotice("AK 旧草稿升级数据读取失败，保留当前草稿内容。");
+      }
+    }
+    return current;
   }
 
-  async function openAkProject() {
+  async function openAkProject(mode: "designed" | "baseline" = "designed") {
     dismiss();
     setBusy(true);
     try {
-      reset(await applyAkBeachDesign(await readAkProject()));
-      setNotice("已打开 AK 室外大地图。");
+      if (mode === "baseline") {
+        reset(await readAkProject());
+        setNotice("已打开 AK 原始快照。");
+      } else {
+        let project = await readAkDesignedProject();
+        const local = await readLocalAkBaseline();
+        if (local) project = hydrateAkSceneDetails(project, local);
+        reset(project);
+        setNotice("已打开 AK 设计地图。");
+      }
     } catch (error) {
       setNotice(errorText(error));
     } finally {
@@ -593,10 +597,11 @@ export default function TilemapEditor() {
       </div>
     </Dialog>}
     {modal?.type === "ak" && <Dialog title="打开 AK 大地图" onDismiss={dismiss}>
-      <p>打开原始 AK 地图会替换当前本地草稿。可以先下载当前项目。</p>
+      <p>加载 AK 项目包会替换当前本地草稿。可以先下载当前项目。</p>
       <div className="tm-dialog-actions">
         <button type="button" onClick={dismiss}>取消</button>
-        <button type="button" className="tm-primary" onClick={openAkProject}>打开原始 AK 地图</button>
+        <button type="button" onClick={() => void openAkProject("baseline")}>打开原始快照</button>
+        <button type="button" className="tm-primary" onClick={() => void openAkProject("designed")}>打开 AK 设计地图</button>
       </div>
     </Dialog>}
     {modal?.type === "open" && <Dialog title="打开项目" onDismiss={dismiss}>

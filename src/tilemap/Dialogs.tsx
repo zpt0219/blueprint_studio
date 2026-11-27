@@ -162,7 +162,7 @@ export function PaletteDialog({ asset, atlases, initial, source, onDismiss, onSa
           <option value="single">单格</option><option value="edge">按边（4×4）</option>
           <option value="corner">按角（4×4）</option><option value="cliff">高台（4×5）</option>
         </select></label>
-        <label>地表抬高（格）<input disabled={usage === "decoration"} required type="number" min={0} max={MAX_HEIGHT} value={height}
+        <label>地表抬高（格）<input disabled={usage === "decoration"} required type="number" min={0} max={MAX_HEIGHT} step="any" value={height}
           onChange={event => setHeight(event.target.value)} /></label>
       </div>
       <div className="tm-palette-settings">

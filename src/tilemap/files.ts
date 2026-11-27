@@ -35,6 +35,10 @@ function integer(value: unknown, min: number, max: number): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
 }
 
+function nonNegative(value: unknown, max: number): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= max;
+}
+
 function id(value: unknown): value is string {
   return typeof value === "string" && /^[a-zA-Z0-9-]{1,100}$/.test(value);
 }
@@ -207,7 +211,7 @@ export async function decodeProject(bytes: Uint8Array): Promise<TileMap> {
   for (const item of json.palettes) {
     const tileset = record(item) && typeof item.tileset === "string" ? assets.get(item.tileset) : undefined;
     if (!record(item) || !id(item.id) || !name(item.name) || !tileset || palettes.has(item.id)
-      || !integer(item.height, 0, MAX_HEIGHT) || !Array.isArray(item.tiles)
+      || !nonNegative(item.height, MAX_HEIGHT) || !Array.isArray(item.tiles)
       || (item.mode !== "single" && item.mode !== "edge" && item.mode !== "corner" && item.mode !== "cliff")
       || item.tiles.length !== paletteTileCount(item.mode) || !item.tiles.some(Boolean)
       || !item.tiles.every(tile => tile === null || point(tile, tileset))
