@@ -1,7 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { makeMap, makeLayer, paint, resolveSurfaces, type Palette, type TileMap, type Tileset } from "./model";
+import {
+  deleteEncounter, fillElevationRect, fillRect, flattenElevationRect, floodFill,
+  makeMap, makeLayer, moveEncounter, paint, paintElevationDelta, pickCell,
+  resolveSurfaces, upsertEncounter, type Palette, type TileMap, type Tileset,
+} from "./model";
 import { clearSelection, copySelection, moveSelection, pasteSelection } from "./selection";
 import { mergePack, replaceTileset } from "./assets";
 import {
@@ -10,6 +14,7 @@ import {
 } from "./akBeachDesign";
 import { decodeProject, encodeProject } from "./files";
 import { AK_PREVIEW_VERSION, buildWorldPatch } from "./world";
+import { materializeDeltaProject, packDeltaProject, rebaseWorldSnapshot } from "./worldRebase";
 import { changeHistory, makeHistory } from "./history";
 
 const asset: Tileset = { id: "custom", name: "我的图集", tileSize: 16, width: 64, height: 64, png: new Blob() };
@@ -99,10 +104,50 @@ describe("editing workflow", () => {
     expect(surface.decorations).toEqual([{ tile: { tileset: "custom", x: 16, y: 32 }, size: [1, 2], blocked: true }]);
   });
 
-  it("loads standalone AK designed .bptilemap and .bppalette with full round-trip and baseline patch diff", async () => {
+  it("supports eyedropper, flood fill, rect fill, relative/flatten elevation, and encounter triggers", () => {
+    const map = fixture(), layer = map.layers[0].id;
+    expect(pickCell(map, layer, [0, 0])).toEqual({ palette: palette.id });
+    expect(pickCell(map, layer, [3, 2])).toBeNull();
+
+    const filled = floodFill(map, layer, [2, 0], { tileset: asset.id, x: 0, y: 0 });
+    expect(Object.keys(filled.layers[0].cells)).toHaveLength(12);
+    expect(filled.layers[0].cells[0]).toEqual({ palette: palette.id });
+    expect(filled.layers[0].cells[2]).toEqual({ tileset: asset.id, x: 0, y: 0 });
+
+    const rected = fillRect(map, layer, [1, 1], [2, 2], { palette: palette.id });
+    expect([5, 6, 9, 10].every(i => rected.layers[0].cells[i])).toBe(true);
+
+    const visited = new Set<number>();
+    let raised = paintElevationDelta(map, [0, 0], [1, 0], 1, 0.5, visited);
+    // Painting over the same tile in the same stroke must not compound twice.
+    raised = paintElevationDelta(raised, [0, 0], [0, 0], 1, 0.5, visited);
+    expect(raised.world?.elevations?.[0]).toBe(3.5);
+    expect(raised.world?.elevations?.[1]).toBe(3.5);
+
+    const shifted = fillElevationRect(raised, [0, 0], [1, 1], "delta", 1);
+    expect(shifted.world?.elevations?.[0]).toBe(4.5);
+    expect(shifted.world?.elevations?.[4]).toBe(4);
+    const flattened = flattenElevationRect(shifted, [0, 0], [1, 1]);
+    expect(flattened.world?.elevations?.[0]).toBe(4.25);
+    expect(flattened.world?.elevations?.[4]).toBe(4.25);
+
+    let withEnc = upsertEncounter(map, { id: "boss-1", name: "神殿 Boss", kind: "boss", position: [2, 3, 2], radius: 12, tag: "lake_boss" });
+    withEnc = moveEncounter(withEnc, "boss-1", 6, 6);
+    expect(withEnc.world?.encounters?.[0].position).toEqual([6, 3, 6]);
+    expect(buildWorldPatch(withEnc, map).encounters).toEqual(withEnc.world?.encounters);
+    expect(deleteEncounter(withEnc, "boss-1").world?.encounters).toBeUndefined();
+  });
+
+  it("loads compact delta AK designed .bptilemap and .bppalette with Boss trigger, beach landmarks, and baseline patch", async () => {
     stubPngBitmap();
+    const designedRawBytes = readSampleBytes("ak-world-designed.bptilemap");
+    // Compact delta project stays under 1 MB (vs ~9.2 MB duplicated full snapshot).
+    expect(designedRawBytes.length).toBeLessThan(1_000_000);
+
     const baseline = await decodeProject(readSampleBytes("ak-world.bptilemap"));
-    const designed = await decodeProject(readSampleBytes("ak-world-designed.bptilemap"));
+    const designedDelta = await decodeProject(designedRawBytes);
+    expect(designedDelta.world?.delta).toBe(true);
+    const designed = materializeDeltaProject(designedDelta, baseline);
     const kit = await decodeProject(readSampleBytes("ak-coast-kit.bppalette"));
 
     expect(needsAkSceneHydration(designed)).toBe(false);
@@ -116,10 +161,15 @@ describe("editing workflow", () => {
 
     const decoLayer = designed.layers.find(item => item.id === AK_COAST_LAYER_ID);
     expect(decoLayer).toBeDefined();
-    expect(Object.keys(decoLayer!.cells).length).toBeGreaterThan(280);
-    expect(Object.keys(designed.layers[1].cells).length).toBeGreaterThan(1600);
+    expect(Object.keys(decoLayer!.cells).length).toBeGreaterThan(295);
+    // Verify southern beach 3D landmarks & Lake Temple Boss Altar
+    expect(decoLayer!.cells[149 * 200 + 41]).toEqual({ palette: "scene-camp-tent" });
+    expect(decoLayer!.cells[149 * 200 + 81]).toEqual({ palette: "ruin-watchtower" });
+    expect(decoLayer!.cells[147 * 200 + 13]).toEqual({ palette: "scene-stone-well" });
+    expect(decoLayer!.cells[147 * 200 + 16]).toEqual({ palette: "ruin-arch" });
     expect(designed.layers[0].cells[88 * 200 + 114]).toEqual({ palette: "ruin-altar-rune" });
     expect(designed.world?.elevations?.[88 * 200 + 114]).toBe(3.9);
+    expect(designed.world?.encounters?.some(e => e.id === "lake-temple-boss" && e.kind === "boss")).toBe(true);
 
     const seHeights = Object.entries(designed.world?.elevations ?? {})
       .filter(([key]) => Number(key) >= 22200)
@@ -143,19 +193,47 @@ describe("editing workflow", () => {
     expect(designed.palettes.find(p => p.id === "ruin-wall-block")?.height).toBe(0.4);
     expect(kit.palettes).toHaveLength(32);
 
-    // Round-trip encodeProject -> decodeProject succeeds including fractional ruin-wall-block height.
-    const roundTripped = await decodeProject(await encodeProject(designed));
-    expect(roundTripped.palettes.find(p => p.id === "ruin-wall-block")?.height).toBe(0.4);
-
-    // Patch against unmodified Godot baseline includes beach, temple, SE desert, and custom Scene Kit edits.
+    // Round-trip compact delta pack -> encode -> decode -> materialize produces identical patch!
+    const repackedBytes = await encodeProject(packDeltaProject(designed, baseline));
+    const rematerialized = materializeDeltaProject(await decodeProject(repackedBytes), baseline);
     const patch = buildWorldPatch(designed, baseline);
+    const patchFromDelta = buildWorldPatch(rematerialized, baseline);
+    expect(patchFromDelta).toEqual(patch);
     expect(patch.changes.length).toBeGreaterThan(800);
     expect(patch.elevations.length).toBeGreaterThan(1300);
     expect(patch.decorations.length).toBeGreaterThan(40);
+    expect(patch.encounters).toHaveLength(1);
+  });
 
-    const withKit = paint(designed, AK_COAST_LAYER_ID, [10, 10], [10, 10], 1, { palette: "scene-camp-tent" });
-    const kitPatch = buildWorldPatch(withKit, baseline);
-    expect(kitPatch.changes.some(c => c.tile[0] === 10 && c.tile[1] === 10 && c.cell && "palette" in c.cell && c.cell.palette === "scene-camp-tent")).toBe(true);
+  it("rebases both delta and full AK projects onto a newer baseline revision while preserving edits", async () => {
+    stubPngBitmap();
+    const oldBaseline = await decodeProject(readSampleBytes("ak-world.bptilemap"));
+    const designedDelta = await decodeProject(readSampleBytes("ak-world-designed.bptilemap"));
+    const designedFull = materializeDeltaProject(designedDelta, oldBaseline);
+
+    // Simulate a newly exported Godot snapshot with a new revision and one extra native card.
+    const extraCard = { ...oldBaseline.world!.cards![0], id: "Vegetation/NewTree/Card" };
+    const newBaseline: TileMap = {
+      ...oldBaseline,
+      world: {
+        ...oldBaseline.world!,
+        revision: "new-godot-snapshot-rev-999",
+        cards: [...oldBaseline.world!.cards!, extraCard],
+      },
+    };
+
+    const fromDelta = rebaseWorldSnapshot(designedDelta, newBaseline);
+    expect(fromDelta.map.world?.revision).toBe("new-godot-snapshot-rev-999");
+    expect(fromDelta.map.world?.cards?.some(c => c.id === "Vegetation/NewTree/Card")).toBe(true);
+    expect(fromDelta.map.world?.encounters).toHaveLength(1);
+    expect(fromDelta.report.deletedCards).toBe(42);
+    // Rebased project can immediately build a valid patch against newBaseline!
+    expect(buildWorldPatch(fromDelta.map, newBaseline).revision).toBe("new-godot-snapshot-rev-999");
+
+    const fromFullWithOld = rebaseWorldSnapshot(designedFull, newBaseline, oldBaseline);
+    expect(fromFullWithOld.map.world?.revision).toBe("new-godot-snapshot-rev-999");
+    expect(fromFullWithOld.report.adoptedCards).toBe(1);
+    expect(buildWorldPatch(fromFullWithOld.map, newBaseline).elevations.length).toBeGreaterThan(1300);
   });
 
   it("hydrates native scene details without overwriting previewVersion or mutating layers/elevations", async () => {
@@ -174,7 +252,6 @@ describe("editing workflow", () => {
     };
     expect(needsAkSceneHydration(legacyDraft)).toBe(true);
     const hydrated = hydrateAkSceneDetails(legacyDraft, baseline);
-    // Crucial regression guard for Bug #1: previewVersion must NOT be prematurely bumped before migration!
     expect(hydrated.world?.previewVersion).toBe(4);
     expect(hydrated.world?.terrain).toBe(baseline.world?.terrain);
     expect(hydrated.world?.wallColliders).toBe(baseline.world?.wallColliders);
@@ -186,10 +263,9 @@ describe("editing workflow", () => {
   it("migrates legacy v4/v5 drafts even if previously stamped v5/v7, while preserving unrelated user edits", async () => {
     stubPngBitmap();
     const baseline = await decodeProject(readSampleBytes("ak-world.bptilemap"));
-    const designed = await decodeProject(readSampleBytes("ak-world-designed.bptilemap"));
+    const designed = materializeDeltaProject(await decodeProject(readSampleBytes("ak-world-designed.bptilemap")), baseline);
     const oldCoastTileset = { ...designed.tilesets.find(t => t.id === AK_COAST_TILESET_ID)!, height: 640 };
 
-    // Case 1: v4 draft falsely stamped previewVersion=5 (or 7) with old Lake Temple & missing SE desert fix.
     const v4Draft: TileMap = {
       ...baseline,
       tilesets: [...baseline.tilesets, oldCoastTileset],
@@ -201,42 +277,31 @@ describe("editing workflow", () => {
       ],
       world: {
         ...baseline.world!,
-        previewVersion: 7, // Simulates the old Bug #1 falsely stamping v7 before upgrading!
+        previewVersion: 7,
         elevations: { 17114: 3.7, 16708: 5.1, 120: 7.5 },
       },
     };
     const migratedV4 = migrateLegacyAkDraft(v4Draft, designed);
     expect(migratedV4.world?.previewVersion).toBe(AK_PREVIEW_VERSION);
-    // SE desert highlands applied & sand fix restored
     expect(migratedV4.world?.elevations?.[26335]).toBe(5);
     expect(migratedV4.layers[0].cells[25767]).toEqual({ palette: "sand" });
-    // Lake Temple upgraded to v7 without leaving empty ground holes where old v5 altar sat
     expect(migratedV4.layers[0].cells[88 * 200 + 114]).toEqual({ palette: "ruin-altar-rune" });
     expect(migratedV4.world?.elevations?.[88 * 200 + 114]).toBe(3.9);
     expect(migratedV4.layers[0].cells[16714]).toBeDefined();
     expect(migratedV4.world?.elevations?.[16708]).toBeUndefined();
-    // 8-row ak-coast tileset + 3D Scene Kit palettes added
     expect(migratedV4.tilesets.find(t => t.id === AK_COAST_TILESET_ID)?.height).toBe(1024);
     expect(migratedV4.palettes.some(p => p.id === "scene-camp-tent")).toBe(true);
-    // Unrelated user edits outside SE desert & Lake Temple are preserved untouched!
     expect(migratedV4.layers[0].cells[120]).toEqual({ palette: "snow" });
     expect(migratedV4.layers[1].cells[55]).toEqual({ palette: "road" });
     expect(migratedV4.world?.elevations?.[120]).toBe(7.5);
     expect(migratedV4.layers.find(l => l.id === AK_COAST_LAYER_ID)?.cells[23062]).toEqual({ palette: "coast-palm-left" });
 
-    // Case 2: v5 draft with legacy 9m SE highlands falsely stamped previewVersion=7 -> rescaled to 5m.
     const v5Draft: TileMap = {
       ...designed,
       world: {
         ...designed.world!,
         previewVersion: 7,
-        elevations: {
-          ...designed.world!.elevations!,
-          26335: 9,
-          27138: 7.5,
-          27338: 6,
-          27538: 4.5,
-        },
+        elevations: { ...designed.world!.elevations!, 26335: 9, 27138: 7.5, 27338: 6, 27538: 4.5 },
       },
     };
     const migratedV5 = migrateLegacyAkDraft(v5Draft, designed);
@@ -246,15 +311,12 @@ describe("editing workflow", () => {
     expect(migratedV5.world?.elevations?.[27538]).toBe(3.5);
     expect(migratedV5.world?.previewVersion).toBe(AK_PREVIEW_VERSION);
 
-    // Case 3: Once at AK_PREVIEW_VERSION (v8), subsequent user edits are NEVER overwritten!
     const customized = {
       ...migratedV5,
       world: { ...migratedV5.world!, elevations: { ...migratedV5.world!.elevations!, 26335: 8.2 } },
     };
     expect(needsLegacyAkMigration(customized)).toBe(false);
     expect(migrateLegacyAkDraft(customized, designed)).toBe(customized);
-
-    // Case 4: Raw baseline draft without ak-coast-deco is NEVER silently mutated!
     expect(needsLegacyAkMigration(baseline)).toBe(false);
     expect(migrateLegacyAkDraft(baseline, designed)).toBe(baseline);
   });

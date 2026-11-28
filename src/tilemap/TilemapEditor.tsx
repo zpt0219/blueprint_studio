@@ -6,12 +6,18 @@ import { changeHistory, makeHistory, type Edit } from "./history";
 import Layers from "./Layers";
 import MapCanvas from "./MapCanvas";
 import Materials from "./Materials";
-import { cardPosition, deleteCard, moveCard, cellReferences, gridPosition, makeMap, paint, paintElevation, resolveSurfaces, worldPosition, type Cell, type Palette, type Point, type TileMap } from "./model";
+import {
+  cardPosition, deleteCard, deleteEncounter, fillElevationRect, fillRect, flattenElevationRect,
+  floodFill, moveCard, moveEncounter, cellReferences, gridPosition, makeMap, newId, paint,
+  paintElevation, paintElevationDelta, pickCell, resolveSurfaces, upsertEncounter, worldPosition,
+  type Cell, type EncounterKind, type Palette, type Point, type TileMap,
+} from "./model";
 import { mergePack, replaceTileset } from "./assets";
 import { hydrateAkSceneDetails, migrateLegacyAkDraft, needsAkSceneHydration, needsLegacyAkMigration, readAkDesignedProject } from "./akBeachDesign";
 import { buildPortablePatch } from "./patchAssets";
 import { copySelection, clearSelection, moveSelection, pasteSelection, type Selection, type Clipboard } from "./selection";
 import { AK_PROJECT_URL, worldPreviewSurfaces } from "./world";
+import { materializeDeltaProject, packDeltaProject, rebaseWorldSnapshot } from "./worldRebase";
 import { terrainHeightAt } from "./worldTerrainData";
 import "./tilemap.css";
 
@@ -19,7 +25,8 @@ const MapPreview = lazy(() => import("./MapPreview"));
 
 type Modal =
   | { type: "tileset" | "recover" | "game" | "new" | "upload" | "palette" | "remove-asset" | "remove-palette" | "remove-layer" | "ak" }
-  | { type: "open"; file: File };
+  | { type: "open"; file: File }
+  | { type: "rebase"; doc: TileMap; baseline: TileMap; filename: string };
 
 function errorText(error: unknown) {
   return error instanceof Error ? error.message : "文件操作失败。";
@@ -39,15 +46,20 @@ export default function TilemapEditor() {
   const [assetId, setAssetId] = useState("");
   const [selected, setSelected] = useState<Cell | null>(null);
   const [materialsMode, setMaterialsMode] = useState<"atlas" | "palette">("atlas");
-  const [tool, setTool] = useState<"brush" | "eraser" | "elevation" | "select" | "area">("brush");
+  const [tool, setTool] = useState<"brush" | "eraser" | "eyedropper" | "fill" | "rect" | "elevation" | "select" | "area" | "encounter">("brush");
+  const [elevationMode, setElevationMode] = useState<"set" | "delta" | "flatten">("set");
+  const [elevationShape, setElevationShape] = useState<"brush" | "rect">("brush");
   const [selection, setSelection] = useState<Selection | null>(null);
   const clipboard = useRef<Clipboard | null>(null);
   const [savedMap, setSavedMap] = useState<TileMap>();
   const [savePending, setSavePending] = useState(false);
   const packInput = useRef<HTMLInputElement>(null);
   const [selectedCard, setSelectedCard] = useState<string | null>(null);
+  const [selectedEncounter, setSelectedEncounter] = useState<string | null>(null);
   const [brushSize, setBrushSize] = useState(1);
   const [elevation, setElevation] = useState("3");
+  const elevationVisited = useRef<Set<number>>(new Set());
+  const flattenTarget = useRef<number | null>(null);
   const [show3D, setShow3D] = useState(false);
   const [focus, setFocus] = useState<Point>();
   const [pointFocus, setPointFocus] = useState<Point>();
@@ -96,6 +108,7 @@ export default function TilemapEditor() {
   const previewSurfaces = useMemo(() => worldPreviewSurfaces(surfaces, world?.lavaCells), [surfaces, world?.lavaCells]);
   const activeCard = world?.cards?.find(card => card.id === selectedCard);
   const activeCardPosition = world && activeCard && cardPosition(world, map.width, activeCard, surfaces);
+  const activeEncounter = world?.encounters?.find(enc => enc.id === selectedEncounter);
   const focusPosition = world && previewFocus && worldPosition(world, ...previewFocus).map(value => Number(value.toFixed(3)));
   const focusIndex = focusedTile && focusedTile[1] * map.width + focusedTile[0];
   const focusSurface = focusIndex === undefined ? undefined : surfaces[focusIndex];
@@ -191,12 +204,22 @@ export default function TilemapEditor() {
         dispatch({ type: "edit", apply: current => deleteCard(current, selectedCard) });
       } else if (event.key === "Escape" && tool === "select") {
         setSelectedCard(null);
+      } else if (tool === "encounter" && (event.key === "Delete" || event.key === "Backspace") && selectedEncounter) {
+        event.preventDefault();
+        dispatch({ type: "edit", apply: current => deleteEncounter(current, selectedEncounter) });
+        setSelectedEncounter(null);
+      } else if (event.key === "Escape" && tool === "encounter") {
+        setSelectedEncounter(null);
       } else if (key === "v" && map.world?.cards) setTool("select");
+      else if (key === "t" && map.world) setTool("encounter");
       else if (event.code === "Space" && !target?.closest("button, summary")) {
         event.preventDefault();
         setPanKey(true);
       } else if (key === "b") setTool("brush");
       else if (key === "e") setTool("eraser");
+      else if (key === "i") setTool("eyedropper");
+      else if (key === "g") setTool("fill");
+      else if (key === "u") setTool("rect");
     };
     const onKeyUp = (event: KeyboardEvent) => { if (event.code === "Space") clearPan(); };
     window.addEventListener("keydown", onKeyDown);
@@ -207,7 +230,7 @@ export default function TilemapEditor() {
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", clearPan);
     };
-  }, [busy, modal, ready, tool, selectedCard, map, selection, activeLayer.id, focusedTile]);
+  }, [busy, modal, ready, tool, selectedCard, selectedEncounter, map, selection, activeLayer.id, focusedTile]);
 
   const dismiss = () => setModal(null);
   const edit = (apply: Edit) => dispatch({ type: "edit", apply });
@@ -218,6 +241,7 @@ export default function TilemapEditor() {
     setAssetId(next.tilesets[0]?.id ?? "");
     setSelected(null);
     setSelectedCard(null);
+    setSelectedEncounter(null);
     setSelection(null);
     clipboard.current = null;
     setMaterialsMode(next.palettes.some(palette => palette.tileset === next.tilesets[0]?.id) ? "palette" : "atlas");
@@ -236,7 +260,23 @@ export default function TilemapEditor() {
     setBusy(true);
     try {
       if (file.size > MAX_PROJECT_BYTES) throw new Error("项目包最多 96 MB。");
-      reset(await withAkSceneDetails(await decodeProject(new Uint8Array(await file.arrayBuffer()))));
+      const decoded = await decodeProject(new Uint8Array(await file.arrayBuffer()));
+      if (decoded.world?.id === "ak-world-v1") {
+        try {
+          const baseline = await readAkProject();
+          if (baseline.world && decoded.world.revision !== baseline.world.revision) {
+            setModal({ type: "rebase", doc: decoded, baseline, filename: file.name });
+            return;
+          }
+          const materialized = decoded.world.delta ? materializeDeltaProject(decoded, baseline) : decoded;
+          reset(needsAkSceneHydration(materialized) ? hydrateAkSceneDetails(materialized, baseline) : materialized);
+          setNotice(`已打开 ${file.name}。`);
+          return;
+        } catch {
+          if (decoded.world.delta) throw new Error("无法读取 AK 基线快照，无法展开增量项目包。");
+        }
+      }
+      reset(await withAkSceneDetails(decoded));
       setNotice(`已打开 ${file.name}。`);
     } catch (error) {
       setNotice(errorText(error));
@@ -269,16 +309,19 @@ export default function TilemapEditor() {
   async function withAkSceneDetails(document: TileMap, options?: { migrateDraft?: boolean }): Promise<TileMap> {
     if (document.world?.id !== "ak-world-v1") return document;
     let current = document;
-    if (needsAkSceneHydration(current)) {
+    let baseline: TileMap | undefined;
+    if (current.world?.delta || needsAkSceneHydration(current)) {
       try {
-        current = hydrateAkSceneDetails(current, await readAkProject());
+        baseline = await readAkProject();
+        if (current.world?.delta) current = materializeDeltaProject(current, baseline);
+        if (needsAkSceneHydration(current)) current = hydrateAkSceneDetails(current, baseline);
       } catch {
         setNotice("AK 场景素材读取失败，可以稍后重新打开项目。");
       }
     }
     if (options?.migrateDraft && needsLegacyAkMigration(current)) {
       try {
-        current = migrateLegacyAkDraft(current, await readAkDesignedProject());
+        current = migrateLegacyAkDraft(current, await readAkDesignedProject(baseline));
       } catch {
         setNotice("AK 旧草稿升级数据读取失败，保留当前草稿内容。");
       }
@@ -290,13 +333,12 @@ export default function TilemapEditor() {
     dismiss();
     setBusy(true);
     try {
+      const baseline = await readAkProject();
       if (mode === "baseline") {
-        reset(await readAkProject());
+        reset(baseline);
         setNotice("已打开 AK 原始快照。");
       } else {
-        let project = await readAkDesignedProject();
-        const local = await readLocalAkBaseline();
-        if (local) project = hydrateAkSceneDetails(project, local);
+        const project = await readAkDesignedProject(baseline);
         reset(project);
         setNotice("已打开 AK 设计地图。");
       }
@@ -332,9 +374,22 @@ export default function TilemapEditor() {
   async function download() {
     setBusy(true);
     try {
-      const bytes = await encodeProject(map);
+      let target = map;
+      let compact = false;
+      if (map.world?.id === "ak-world-v1") {
+        try {
+          const baseline = await readAkProject();
+          if (baseline.world?.revision === map.world.revision) {
+            target = packDeltaProject(map, baseline);
+            compact = true;
+          }
+        } catch {
+          // Fall back to full standalone archive if baseline is unreachable.
+        }
+      }
+      const bytes = await encodeProject(target);
       saveFile(new Blob([bytes as BlobPart], { type: "application/zip" }), world ? "ak-world.bptilemap" : "tilemap.bptilemap");
-      setNotice("项目包已生成。");
+      setNotice(compact ? `增量项目包已生成（${Math.round(bytes.length / 1024)} KB）。` : "项目包已生成。");
     } catch (error) {
       setNotice(errorText(error));
     } finally {
@@ -391,15 +446,115 @@ export default function TilemapEditor() {
 
   function draw(from: Point, to: Point) {
     if (tool === "elevation") {
-      const metres = Number(elevation);
-      if (elevation.trim() && Number.isFinite(metres) && metres >= -20 && metres <= 100) {
-        dispatch({ type: "stroke", apply: current => paintElevation(current, from, to, brushSize, metres) });
+      if (elevationMode === "flatten") {
+        if (flattenTarget.current === null && world) {
+          const idx = from[1] * map.width + from[0];
+          flattenTarget.current = world.elevations?.[idx] ?? world.heights[idx] ?? 0;
+        }
+        if (flattenTarget.current !== null) {
+          const target = flattenTarget.current;
+          dispatch({ type: "stroke", apply: current => paintElevation(current, from, to, brushSize, target) });
+        }
+        return;
+      }
+      const value = Number(elevation);
+      if (!elevation.trim() || !Number.isFinite(value)) return;
+      if (elevationMode === "delta") {
+        if (value >= -40 && value <= 40 && value !== 0) {
+          dispatch({ type: "stroke", apply: current => paintElevationDelta(current, from, to, brushSize, value, elevationVisited.current) });
+        }
+        return;
+      }
+      if (value >= -20 && value <= 100) {
+        dispatch({ type: "stroke", apply: current => paintElevation(current, from, to, brushSize, value) });
       }
       return;
     }
     const cell = tool === "eraser" ? null : brush;
     if (tool === "brush" && !cell) return;
     dispatch({ type: "stroke", apply: current => paint(current, activeLayer.id, from, to, brushSize, cell) });
+  }
+
+  function finishStroke() {
+    elevationVisited.current.clear();
+    flattenTarget.current = null;
+    dispatch({ type: "finish" });
+  }
+
+  function pickAt(tile: Point) {
+    const idx = tile[1] * map.width + tile[0];
+    if (tool === "elevation" && world) {
+      const metres = world.elevations?.[idx] ?? world.heights[idx];
+      if (metres !== undefined) {
+        const rounded = Number(metres.toFixed(2));
+        setElevation(String(rounded));
+        setNotice(`已吸取高程 ${rounded} 米。`);
+      }
+      return;
+    }
+    const picked = pickCell(map, activeLayer.id, tile);
+    if (!picked) {
+      setNotice("该格没有可吸取的素材。");
+      return;
+    }
+    setSelected(picked);
+    if ("palette" in picked) {
+      const pal = map.palettes.find(item => item.id === picked.palette);
+      if (pal) {
+        setAssetId(pal.tileset);
+        setMaterialsMode("palette");
+        setNotice(`已吸取素材「${pal.name}」。`);
+      }
+    } else {
+      setAssetId(picked.tileset);
+      setMaterialsMode("atlas");
+      setNotice("已吸取图集格。");
+    }
+    if (tool === "eyedropper") setTool("brush");
+  }
+
+  function fillAt(tile: Point) {
+    if (!activeLayer.visible) { setNotice("当前图层已隐藏，请先显示图层。"); return; }
+    if (!brush) { setNotice("请先选择一个素材再填充。"); return; }
+    edit(current => floodFill(current, activeLayer.id, tile, brush));
+  }
+
+  function rectDraw(from: Point, to: Point) {
+    if (tool === "elevation") {
+      if (elevationMode === "flatten") {
+        edit(current => flattenElevationRect(current, from, to));
+        return;
+      }
+      const value = Number(elevation);
+      if (!elevation.trim() || !Number.isFinite(value)) return;
+      if (elevationMode === "delta" && value >= -40 && value <= 40 && value !== 0) {
+        edit(current => fillElevationRect(current, from, to, "delta", value));
+      } else if (elevationMode === "set" && value >= -20 && value <= 100) {
+        edit(current => fillElevationRect(current, from, to, "set", value));
+      }
+      return;
+    }
+    if (!activeLayer.visible) { setNotice("当前图层已隐藏，请先显示图层。"); return; }
+    if (!brush) { setNotice("请先选择一个素材再矩形填充。"); return; }
+    edit(current => fillRect(current, activeLayer.id, from, to, brush));
+  }
+
+  function placeEncounter(worldX: number, worldZ: number) {
+    if (!world) return;
+    const [gx, gz] = gridPosition(world, worldX, worldZ);
+    const idx = Math.floor(gz) * map.width + Math.floor(gx);
+    const y = Number((world.elevations?.[idx] ?? world.heights[idx] ?? 0).toFixed(3));
+    const encounter = {
+      id: newId(),
+      name: `遭遇点 ${(world.encounters?.length ?? 0) + 1}`,
+      kind: "encounter" as EncounterKind,
+      position: [Number(worldX.toFixed(3)), y, Number(worldZ.toFixed(3))] as [number, number, number],
+      radius: 10,
+      tag: "",
+    };
+    edit(current => upsertEncounter(current, encounter));
+    setSelectedEncounter(encounter.id);
+    setNotice(`已放置触发区「${encounter.name}」。`);
   }
 
   async function setTestPoint([x, z]: Point) {
@@ -457,8 +612,11 @@ export default function TilemapEditor() {
     <main className={show3D ? "tm-workspace tm-split" : "tm-workspace"}>
       <section className="tm-editor" aria-label="地图编辑区">
         <MapCanvas key={`map-${revision}`} width={map.width} height={map.height} atlases={atlases} surfaces={previewSurfaces}
-          brushSize={brushSize} canPaint={!busy && tool !== "area" && tool !== "select" && (tool === "elevation" || (activeLayer.visible && (tool === "eraser" || !!brush)))} panKey={panKey}
-          onPaint={draw} onCommit={() => dispatch({ type: "finish" })} world={world} focus={world || show3D ? previewFocus : undefined} jump={jump}
+          brushSize={brushSize}
+          canPaint={!busy && (tool === "brush" || tool === "eraser" || (tool === "elevation" && elevationShape === "brush"))
+            && (tool === "elevation" || (activeLayer.visible && (tool === "eraser" || !!brush)))}
+          panKey={panKey}
+          onPaint={draw} onCommit={finishStroke} world={world} focus={world || show3D ? previewFocus : undefined} jump={jump}
           onFocus={world || show3D ? focusAt : undefined} onTestPoint={world && !busy ? setTestPoint : undefined}
           selectArea={!busy && tool === "area"} selection={selection} onSelection={setSelection}
           onMoveSelection={(area, at) => {
@@ -467,21 +625,54 @@ export default function TilemapEditor() {
           }}
           selectCards={!busy && tool === "select"} selectedCard={selectedCard} onSelectCard={setSelectedCard}
           onDragCard={(id, x, z) => dispatch({ type: "stroke", apply: current => moveCard(current, id, x, z) })}
-          showElevation={tool === "elevation"} />
+          showElevation={tool === "elevation"}
+          eyedropper={!busy && tool === "eyedropper"} onPickTile={!busy ? pickAt : undefined}
+          fillMode={!busy && tool === "fill"} onFill={!busy ? fillAt : undefined}
+          rectMode={!busy && (tool === "rect" || (tool === "elevation" && elevationShape === "rect"))}
+          onRect={!busy ? rectDraw : undefined}
+          selectEncounters={!busy && tool === "encounter"} selectedEncounter={selectedEncounter}
+          onSelectEncounter={setSelectedEncounter} onPlaceEncounter={!busy ? placeEncounter : undefined}
+          onDragEncounter={(id, x, z) => dispatch({ type: "stroke", apply: current => moveEncounter(current, id, x, z) })} />
         <div className="tm-tools">
           <button type="button" aria-pressed={tool === "brush"} title="画笔 (B)" onClick={() => setTool("brush")}>画笔</button>
           <button type="button" aria-pressed={tool === "eraser"} title="橡皮 (E)" onClick={() => setTool("eraser")}>橡皮</button>
+          <button type="button" aria-pressed={tool === "eyedropper"} title="吸管 (I / Alt+点击)" onClick={() => setTool("eyedropper")}>吸管</button>
+          <button type="button" aria-pressed={tool === "fill"} title="油漆桶填充 (G)" onClick={() => setTool("fill")}>填充</button>
+          <button type="button" aria-pressed={tool === "rect"} title="矩形填充 (U)" onClick={() => setTool("rect")}>矩形</button>
           {!!world?.cards?.length && <button type="button" aria-pressed={tool === "select"} title="选择面片 (V)"
             onClick={() => setTool("select")}>选择</button>}
           <button type="button" aria-pressed={tool === "area"} title="框选当前图层 (R)" onClick={() => setTool("area")}>框选</button>
+          {world && tool === "area" && selection && <button type="button" title="将框选区高程拉平到均值" onClick={() => {
+            edit(current => flattenElevationRect(current, [selection.x, selection.y], [selection.x + selection.width - 1, selection.y + selection.height - 1]));
+            setNotice("已平整选区高程。");
+          }}>平整选区</button>}
+          {world && <button type="button" aria-pressed={tool === "encounter"} title="遭遇点 / Boss 触发区 (T)"
+            onClick={() => setTool("encounter")}>触发区</button>}
           <button type="button" disabled={!history.past.length && !history.strokeStart} title="Ctrl+Z" onClick={() => dispatch({ type: "undo" })}>撤销</button>
           <button type="button" disabled={!history.future.length} title="Ctrl+Shift+Z" onClick={() => dispatch({ type: "redo" })}>重做</button>
           {world && <button type="button" aria-pressed={tool === "elevation"} onClick={() => setTool("elevation")}>高程</button>}
-          {world && tool === "elevation" && <label className="tm-elevation"><input type="number" min={-20} max={100}
-            step={0.01} aria-label="高程（米）" value={elevation} onChange={event => setElevation(event.target.value)} /> 米</label>}
-          <select aria-label="笔刷大小" value={brushSize} onChange={event => setBrushSize(Number(event.target.value))}>
+          {world && tool === "elevation" && <>
+            <select aria-label="高程模式" value={elevationMode} onChange={event => {
+              const next = event.target.value as "set" | "delta" | "flatten";
+              setElevationMode(next);
+              if (next === "delta" && Number(elevation) > 5) setElevation("0.5");
+            }}>
+              <option value="set">绝对</option>
+              <option value="delta">相对 ±</option>
+              <option value="flatten">平整</option>
+            </select>
+            <select aria-label="高程形状" value={elevationShape} onChange={event => setElevationShape(event.target.value as "brush" | "rect")}>
+              <option value="brush">画笔</option>
+              <option value="rect">矩形</option>
+            </select>
+            {elevationMode !== "flatten" && <label className="tm-elevation"><input type="number"
+              min={elevationMode === "delta" ? -40 : -20} max={elevationMode === "delta" ? 40 : 100}
+              step={elevationMode === "delta" ? 0.25 : 0.01} aria-label={elevationMode === "delta" ? "相对高差（米）" : "高程（米）"}
+              value={elevation} onChange={event => setElevation(event.target.value)} /> 米</label>}
+          </>}
+          {(tool === "brush" || tool === "eraser" || (tool === "elevation" && elevationShape === "brush")) && <select aria-label="笔刷大小" value={brushSize} onChange={event => setBrushSize(Number(event.target.value))}>
             {[1, 3, 5, 9].map(size => <option key={size} value={size}>{size} 格</option>)}
-          </select>
+          </select>}
         </div>
         <Layers key={`layers-${revision}`} layers={map.layers} active={activeLayer} onSelect={id => { setLayerId(id); setSelection(null); }} onEdit={edit}
           onRemove={() => setModal({ type: "remove-layer" })} />
@@ -504,8 +695,34 @@ export default function TilemapEditor() {
           <span>{activeCard.name || "面片"} · X {activeCardPosition[0].toFixed(2)} · Y {activeCardPosition[1].toFixed(2)} · Z {activeCardPosition[2].toFixed(2)}</span>
           <button type="button" className="tm-danger" onClick={() => edit(current => deleteCard(current, activeCard.id!))}>删除面片</button>
         </div>}
+        {activeEncounter && tool === "encounter" && <div className="tm-card-inspector tm-encounter-inspector">
+          <input type="text" aria-label="触发区名称" value={activeEncounter.name}
+            onChange={event => edit(current => upsertEncounter(current, { ...activeEncounter, name: event.target.value }))} />
+          <select aria-label="触发区类型" value={activeEncounter.kind}
+            onChange={event => edit(current => upsertEncounter(current, { ...activeEncounter, kind: event.target.value as EncounterKind }))}>
+            <option value="boss">Boss 战</option>
+            <option value="encounter">遭遇点</option>
+            <option value="trigger">事件触发区</option>
+          </select>
+          <label>半径 <input type="number" min={1} max={128} step={0.5} aria-label="触发半径（米）" value={activeEncounter.radius}
+            onChange={event => {
+              const r = Number(event.target.value);
+              if (Number.isFinite(r) && r > 0 && r <= 128) edit(current => upsertEncounter(current, { ...activeEncounter, radius: r }));
+            }} /> 米</label>
+          <input type="text" aria-label="Godot 标签" placeholder="标签（如 lake_temple_boss）" value={activeEncounter.tag ?? ""}
+            onChange={event => edit(current => upsertEncounter(current, { ...activeEncounter, tag: event.target.value || undefined }))} />
+          <span>X {activeEncounter.position[0].toFixed(1)} · Y {activeEncounter.position[1].toFixed(1)} · Z {activeEncounter.position[2].toFixed(1)}</span>
+          <button type="button" className="tm-danger" onClick={() => {
+            edit(current => deleteEncounter(current, activeEncounter.id));
+            setSelectedEncounter(null);
+          }}>删除</button>
+        </div>}
         <div className="tm-map-hint">
           {tool === "area" && <span>框选当前图层 · 拖动移动 · Ctrl+C/X/V · Delete 清除 · Esc 取消</span>}
+          {tool === "encounter" && <span>点击空地放置触发区 · 拖动圆心移动 · Delete 删除</span>}
+          {tool === "eyedropper" && <span>点击格吸取素材（或任意工具按住 Alt+点击）</span>}
+          {tool === "fill" && <span>点击连续同材质区域进行油漆桶填充</span>}
+          {(tool === "rect" || (tool === "elevation" && elevationShape === "rect")) && <span>按住拖动矩形区域批量填充</span>}
           <span>{map.width} × {map.height}{world ? ` · ${world.metresPerTile} 米/格` : ""}</span>
           {world && focusPosition && <span>X {focusPosition[0]} · Y {focusHeight.toFixed(2)} · Z {focusPosition[1]}</span>}
           {world && <span>Shift+点击标记测试点</span>}
@@ -609,6 +826,22 @@ export default function TilemapEditor() {
       <div className="tm-dialog-actions">
         <button type="button" onClick={dismiss}>取消</button>
         <button type="button" className="tm-primary" onClick={() => void openProject(modal.file)}>打开项目</button>
+      </div>
+    </Dialog>}
+    {modal?.type === "rebase" && <Dialog title="迁移到新版 AK 快照" onDismiss={dismiss}>
+      <p>「{modal.filename}」基于旧快照 <code>{modal.doc.world?.revision.slice(0, 10)}</code>，当前内置快照为 <code>{modal.baseline.world?.revision.slice(0, 10)}</code>。迁移会保留你的图层改动、高程、面片删移与触发区，同时替换为新版地形和版本号，以便导出 Godot 补丁。</p>
+      <div className="tm-dialog-actions">
+        <button type="button" onClick={dismiss}>取消</button>
+        {!modal.doc.world?.delta && <button type="button" onClick={() => {
+          const doc = modal.doc;
+          reset(doc);
+          setNotice(`已按原版本打开 ${modal.filename}（导出补丁前需迁移快照）。`);
+        }}>保持原样打开</button>}
+        <button type="button" className="tm-primary" onClick={() => {
+          const { map: migrated, report } = rebaseWorldSnapshot(modal.doc, modal.baseline);
+          reset(migrated);
+          setNotice(`已迁移至新快照 ${report.toRevision.slice(0, 8)} · 保留 ${report.preservedChangedCells} 格改动 · ${report.preservedElevations} 格高程 · ${report.preservedEncounters} 个触发区。`);
+        }}>迁移到最新快照</button>
       </div>
     </Dialog>}
   </div>;

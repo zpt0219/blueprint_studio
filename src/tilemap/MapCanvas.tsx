@@ -3,7 +3,13 @@ import { rectangle, type Selection } from "./selection";
 import { tilesetImage } from "./files";
 import type { WorldImages } from "./worldCards";
 import { drawTile, type Atlases } from "./draw";
-import { gridPosition, WORLD_DETAIL_COLORS, type Point, type Surface, type WorldMap, type WorldCard } from "./model";
+import { gridPosition, WORLD_DETAIL_COLORS, type EncounterKind, type Point, type Surface, type WorldCard, type WorldEncounter, type WorldMap } from "./model";
+
+const ENCOUNTER_COLORS: Record<EncounterKind, { stroke: string; fill: string }> = {
+  boss: { stroke: "#dc2626", fill: "rgba(220, 38, 38, 0.16)" },
+  encounter: { stroke: "#d97706", fill: "rgba(217, 119, 6, 0.15)" },
+  trigger: { stroke: "#0284c7", fill: "rgba(2, 132, 199, 0.15)" },
+};
 
 interface Props {
   width: number;
@@ -29,22 +35,42 @@ interface Props {
   onSelectCard?: (id: string | null) => void;
   onDragCard?: (id: string, x: number, z: number) => void;
   showElevation?: boolean;
+  eyedropper?: boolean;
+  onPickTile?: (at: Point) => void;
+  fillMode?: boolean;
+  onFill?: (at: Point) => void;
+  rectMode?: boolean;
+  onRect?: (from: Point, to: Point) => void;
+  selectEncounters?: boolean;
+  selectedEncounter?: string | null;
+  onSelectEncounter?: (id: string | null) => void;
+  onPlaceEncounter?: (x: number, z: number) => void;
+  onDragEncounter?: (id: string, x: number, z: number) => void;
 }
 
 type Gesture = { id: number } & (
   { kind: "paint"; last: Point } | { kind: "pan"; x: number; y: number }
   | { kind: "area"; start: Point } | { kind: "move-area"; start: Point; area: Selection; at: Point }
+  | { kind: "rect"; start: Point; end: Point }
   | { kind: "card"; card: string; start: Point; original: Point }
+  | { kind: "encounter"; encounter: string; start: Point; original: Point }
   | { kind: "focus" }
 );
 
-export default function MapCanvas({ width, height, atlases, surfaces, brushSize, canPaint, panKey, onPaint, onCommit, world, focus, jump, onFocus, onTestPoint, selectCards, selectedCard, onSelectCard, onDragCard, selectArea, selection, onSelection, onMoveSelection, showElevation }: Props) {
+export default function MapCanvas({
+  width, height, atlases, surfaces, brushSize, canPaint, panKey, onPaint, onCommit,
+  world, focus, jump, onFocus, onTestPoint, selectCards, selectedCard, onSelectCard, onDragCard,
+  selectArea, selection, onSelection, onMoveSelection, showElevation,
+  eyedropper, onPickTile, fillMode, onFill, rectMode, onRect,
+  selectEncounters, selectedEncounter, onSelectEncounter, onPlaceEncounter, onDragEncounter,
+}: Props) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const gesture = useRef<Gesture | null>(null);
   const [viewport, setViewport] = useState({ width: 1, height: 1 });
   const [view, setView] = useState({ zoom: 1, x: 0, y: 0 });
   const [hover, setHover] = useState<Point | null>(null);
   const [hoverFocus, setHoverFocus] = useState(false);
+  const [draftRect, setDraftRect] = useState<Selection | null>(null);
   const [images, setImages] = useState<WorldImages>(new Map());
   const textures = world?.textures;
   const cards = useMemo(() => [...(world?.cards ?? [])].sort((a, b) => a.position[2] - b.position[2]), [world?.cards]);
@@ -388,6 +414,41 @@ export default function MapCanvas({ width, height, atlases, surfaces, brushSize,
         ctx.stroke();
       }
       for (const marker of world.markers) mark(marker.position, "#173e53", 3);
+      for (const enc of world.encounters ?? []) {
+        const [gx, gz] = gridPosition(world, enc.position[0], enc.position[2]);
+        const cx = left + gx * size;
+        const cy = top + gz * size;
+        const pxRadius = Math.max(8, (enc.radius / world.metresPerTile) * size);
+        const colors = ENCOUNTER_COLORS[enc.kind];
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(cx, cy, pxRadius, 0, Math.PI * 2);
+        ctx.fillStyle = colors.fill;
+        ctx.fill();
+        ctx.lineWidth = enc.id === selectedEncounter ? 3 : 2;
+        ctx.strokeStyle = colors.stroke;
+        ctx.setLineDash(enc.kind === "boss" ? [6, 3] : [4, 4]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.arc(cx, cy, enc.id === selectedEncounter ? 6.5 : 5, 0, Math.PI * 2);
+        ctx.fillStyle = colors.stroke;
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = enc.id === selectedEncounter ? "#facc15" : "#ffffff";
+        ctx.stroke();
+        if (size >= 3 || enc.id === selectedEncounter) {
+          ctx.font = "600 11px system-ui, sans-serif";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "bottom";
+          ctx.strokeStyle = "rgba(18, 22, 26, 0.85)";
+          ctx.lineWidth = 3;
+          ctx.strokeText(enc.name, cx, cy - 9);
+          ctx.fillStyle = "#ffffff";
+          ctx.fillText(enc.name, cx, cy - 9);
+        }
+        ctx.restore();
+      }
       if (world.testPoint) mark(world.testPoint, "#bc4b23", 6);
     }
     if (selection && selectArea) {
@@ -397,14 +458,24 @@ export default function MapCanvas({ width, height, atlases, surfaces, brushSize,
       ctx.strokeRect(left + selection.x * size, top + selection.y * size, selection.width * size, selection.height * size);
       ctx.setLineDash([]);
     }
-    if (hover && canPaint && !panKey && !hoverFocus) {
-      const radius = Math.floor(brushSize / 2);
+    if (draftRect) {
+      ctx.fillStyle = showElevation ? "rgba(217, 119, 6, 0.2)" : "rgba(20, 92, 70, 0.22)";
+      ctx.fillRect(left + draftRect.x * size, top + draftRect.y * size, draftRect.width * size, draftRect.height * size);
+      ctx.strokeStyle = showElevation ? "#b45309" : "#145c46";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 3]);
+      ctx.strokeRect(left + draftRect.x * size, top + draftRect.y * size, draftRect.width * size, draftRect.height * size);
+      ctx.setLineDash([]);
+    }
+    if (hover && (canPaint || eyedropper || fillMode || rectMode) && !panKey && !hoverFocus && !draftRect) {
+      const span = (eyedropper || fillMode || rectMode) ? 1 : brushSize;
+      const radius = Math.floor(span / 2);
       const startX = Math.max(0, hover[0] - radius), startY = Math.max(0, hover[1] - radius);
       const endX = Math.min(width, hover[0] + radius + 1), endY = Math.min(height, hover[1] + radius + 1);
       ctx.strokeStyle = "#fff";
       ctx.lineWidth = 3;
       ctx.strokeRect(left + startX * size, top + startY * size, (endX - startX) * size, (endY - startY) * size);
-      ctx.strokeStyle = "#125d48";
+      ctx.strokeStyle = eyedropper ? "#0284c7" : "#125d48";
       ctx.lineWidth = 1;
       ctx.strokeRect(left + startX * size, top + startY * size, (endX - startX) * size, (endY - startY) * size);
     }
@@ -447,7 +518,7 @@ export default function MapCanvas({ width, height, atlases, surfaces, brushSize,
       ctx.fill();
       ctx.restore();
     }
-  }, [atlases, surfaces, viewport, width, height, size, left, top, hover, hoverFocus, brushSize, canPaint, panKey, world, focus, cards, details, relief, showElevation, metres, images, selectedCard, selectCards, selection, selectArea]);
+  }, [atlases, surfaces, viewport, width, height, size, left, top, hover, hoverFocus, brushSize, canPaint, panKey, world, focus, cards, details, relief, showElevation, metres, images, selectedCard, selectCards, selection, selectArea, draftRect, eyedropper, fillMode, rectMode, selectedEncounter]);
 
   useEffect(() => {
     const element = canvas.current!;
@@ -505,6 +576,45 @@ export default function MapCanvas({ width, height, atlases, surfaces, brushSize,
       if (tile[0] < 0 || tile[1] < 0 || tile[0] >= width || tile[1] >= height) return;
       if (event.shiftKey && onTestPoint) {
         onTestPoint(precisePoint(event));
+        return;
+      }
+      if ((event.altKey || eyedropper) && onPickTile) {
+        onPickTile(tile);
+        return;
+      }
+      if (selectEncounters && world) {
+        const bounds = event.currentTarget.getBoundingClientRect();
+        const mx = event.clientX - bounds.left, my = event.clientY - bounds.top;
+        let hitEnc: WorldEncounter | undefined;
+        let bestDist = Infinity;
+        for (const enc of world.encounters ?? []) {
+          const [gx, gz] = gridPosition(world, enc.position[0], enc.position[2]);
+          const d = Math.hypot(mx - (left + gx * size), my - (top + gz * size));
+          if (d <= 14 && d < bestDist) { hitEnc = enc; bestDist = d; }
+        }
+        if (hitEnc) {
+          onSelectEncounter?.(hitEnc.id);
+          gesture.current = {
+            kind: "encounter", id: event.pointerId, encounter: hitEnc.id,
+            start: precisePoint(event), original: [hitEnc.position[0], hitEnc.position[2]],
+          };
+          event.preventDefault();
+          event.currentTarget.setPointerCapture(event.pointerId);
+          return;
+        }
+        const [gx, gz] = precisePoint(event);
+        onPlaceEncounter?.(world.origin[0] + gx * world.metresPerTile, world.origin[1] + gz * world.metresPerTile);
+        return;
+      }
+      if (fillMode && onFill) {
+        onFill(tile);
+        return;
+      }
+      if (rectMode && onRect) {
+        gesture.current = { kind: "rect", id: event.pointerId, start: tile, end: tile };
+        setDraftRect(rectangle(tile, tile));
+        event.preventDefault();
+        event.currentTarget.setPointerCapture(event.pointerId);
         return;
       }
       if (selectArea) {
@@ -567,7 +677,20 @@ export default function MapCanvas({ width, height, atlases, surfaces, brushSize,
         active.original[1] + (next[1] - active.start[1]) * world.metresPerTile);
       return;
     }
+    if (active?.kind === "encounter" && world) {
+      const next = precisePoint(event);
+      onDragEncounter?.(active.encounter, active.original[0] + (next[0] - active.start[0]) * world.metresPerTile,
+        active.original[1] + (next[1] - active.start[1]) * world.metresPerTile);
+      return;
+    }
     const tile = point(event);
+    if (active?.kind === "rect") {
+      tile[0] = Math.max(0, Math.min(width - 1, tile[0]));
+      tile[1] = Math.max(0, Math.min(height - 1, tile[1]));
+      active.end = tile;
+      setDraftRect(rectangle(active.start, tile));
+      return;
+    }
     if (active?.kind === "area" || active?.kind === "move-area") {
       tile[0] = Math.max(0, Math.min(width - 1, tile[0]));
       tile[1] = Math.max(0, Math.min(height - 1, tile[1]));
@@ -605,7 +728,12 @@ export default function MapCanvas({ width, height, atlases, surfaces, brushSize,
       if (event.type === "pointercancel") onSelection?.(active.area);
       else onMoveSelection?.(active.area, active.at);
     }
-    if (active.kind === "paint" || active.kind === "card") onCommit();
+    if (active.kind === "rect") {
+      setDraftRect(null);
+      if (event.type !== "pointercancel") onRect?.(active.start, active.end);
+      return;
+    }
+    if (active.kind === "paint" || active.kind === "card" || active.kind === "encounter") onCommit();
   }
 
   return <canvas ref={canvas} className={panKey || hoverFocus ? "tm-map tm-pan" : "tm-map"} aria-label="2D 地图" tabIndex={0}

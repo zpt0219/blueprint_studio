@@ -10,10 +10,13 @@ export function readWorld(value: unknown, width: number, height: number): WorldM
     Array.isArray(value) && value.length === length && value.every(finite);
   const object = (value: unknown): value is Record<string, unknown> =>
     !!value && typeof value === "object" && !Array.isArray(value);
+  const isDelta = object(value) && value.delta === true;
   if (!object(value) || typeof value.id !== "string" || typeof value.revision !== "string"
     || !vector(value.origin, 2) || typeof value.metresPerTile !== "number"
     || value.metresPerTile <= 0 || value.metresPerTile > 128
-    || !vector(value.heights, width * height) || !Array.isArray(value.markers) || !Array.isArray(value.proxies)
+    || (value.delta !== undefined && typeof value.delta !== "boolean")
+    || !(vector(value.heights, width * height) || (isDelta && vector(value.heights, 0)))
+    || !Array.isArray(value.markers) || !Array.isArray(value.proxies)
     || !value.markers.every(item => object(item) && typeof item.id === "string"
       && typeof item.name === "string" && vector(item.position, 3))
     || !value.proxies.every(item => object(item) && vector(item.position, 3) && vector(item.size, 3)
@@ -30,8 +33,33 @@ export function readWorld(value: unknown, width: number, height: number): WorldM
     || (value.previewVersion !== undefined && !Number.isInteger(value.previewVersion))
     || (value.lavaCells !== undefined && (!Array.isArray(value.lavaCells)
       || !value.lavaCells.every(index => Number.isInteger(index) && index >= 0 && index < width * height)))
-    || (value.testPoint !== undefined && !vector(value.testPoint, 3))) {
+    || (value.testPoint !== undefined && !vector(value.testPoint, 3))
+    || (value.erasedCells !== undefined && (!object(value.erasedCells)
+      || !Object.entries(value.erasedCells).every(([layerId, list]) =>
+        typeof layerId === "string" && layerId.length > 0 && Array.isArray(list)
+        && list.every(index => Number.isInteger(index) && index >= 0 && index < width * height))))
+    || (value.cardDeltas !== undefined && (!object(value.cardDeltas)
+      || (value.cardDeltas.deleted !== undefined && (!Array.isArray(value.cardDeltas.deleted)
+        || !value.cardDeltas.deleted.every(entry => typeof entry === "string" && entry.length > 0)))
+      || (value.cardDeltas.moved !== undefined && (!object(value.cardDeltas.moved)
+        || !Object.values(value.cardDeltas.moved).every(pos => vector(pos, 3))))))) {
     throw new Error("世界坐标或高程数据无效。");
+  }
+  if (value.encounters !== undefined) {
+    const encounterIds = new Set<string>();
+    if (!Array.isArray(value.encounters) || !value.encounters.every(item => {
+      if (!object(item) || typeof item.id !== "string" || !item.id || encounterIds.has(item.id)
+        || typeof item.name !== "string" || !item.name.trim() || item.name.length > 128
+        || !["boss", "encounter", "trigger"].includes(String(item.kind))
+        || !vector(item.position, 3) || !finite(item.radius) || (item.radius as number) <= 0 || (item.radius as number) > 128
+        || (item.tag !== undefined && (typeof item.tag !== "string" || item.tag.length > 128))) {
+        return false;
+      }
+      encounterIds.add(item.id);
+      return true;
+    })) {
+      throw new Error("遭遇点或触发区数据无效。");
+    }
   }
   if (value.details !== undefined && (!Array.isArray(value.details) || !value.details.every(detail => {
     if (!object(detail) || typeof detail.kind !== "string" || !Object.prototype.hasOwnProperty.call(WORLD_DETAIL_COLORS, detail.kind)
@@ -184,5 +212,6 @@ export function buildWorldPatch(map: TileMap, baseline: TileMap) {
   return {
     format: "blueprint-world-patch", version: 1, world: world.id, revision: world.revision,
     origin: world.origin, metresPerTile: world.metresPerTile, changes, paint, elevations, decorations, testPoint,
+    ...(world.encounters?.length ? { encounters: world.encounters } : {}),
   };
 }

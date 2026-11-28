@@ -43,11 +43,26 @@ export interface Layer {
 }
 
 export type WorldPoint = [number, number, number];
+export type EncounterKind = "boss" | "encounter" | "trigger";
 
 export interface WorldMarker {
   id: string;
   name: string;
   position: WorldPoint;
+}
+
+export interface WorldEncounter {
+  id: string;
+  name: string;
+  kind: EncounterKind;
+  position: WorldPoint;
+  radius: number;
+  tag?: string;
+}
+
+export interface WorldCardDeltas {
+  deleted?: string[];
+  moved?: Record<string, WorldPoint>;
 }
 
 export interface WorldProxy {
@@ -109,6 +124,10 @@ export interface WorldMap {
   textures?: WorldTexture[];
   elevations?: Record<number, number>;
   testPoint?: WorldPoint;
+  encounters?: WorldEncounter[];
+  delta?: boolean;
+  cardDeltas?: WorldCardDeltas;
+  erasedCells?: Record<string, number[]>;
 }
 
 export function gridPosition(world: WorldMap, x: number, z: number): Point {
@@ -245,6 +264,186 @@ export function paintElevation(map: TileMap, from: Point, to: Point, size: numbe
     elevations![index] = metres;
   }
   return elevations === world.elevations ? map : { ...map, world: { ...world, elevations } };
+}
+
+function clampMetres(metres: number): number {
+  return Math.round(Math.max(-20, Math.min(100, metres)) * 1000) / 1000;
+}
+
+export function paintElevationDelta(
+  map: TileMap, from: Point, to: Point, size: number, deltaMetres: number, visited?: Set<number>,
+): TileMap {
+  const world = map.world;
+  if (!world || !Number.isFinite(deltaMetres) || deltaMetres === 0) return map;
+  let elevations = world.elevations;
+  for (const index of strokeCells(map.width, map.height, from, to, size)) {
+    if (visited?.has(index)) continue;
+    visited?.add(index);
+    const current = elevations?.[index] ?? world.heights[index] ?? 0;
+    const next = clampMetres(current + deltaMetres);
+    if (next === current) continue;
+    if (elevations === world.elevations) elevations = { ...elevations };
+    elevations![index] = next;
+  }
+  return elevations === world.elevations ? map : { ...map, world: { ...world, elevations } };
+}
+
+export function fillElevationRect(
+  map: TileMap, from: Point, to: Point, mode: "set" | "delta", value: number,
+): TileMap {
+  const world = map.world;
+  if (!world || !Number.isFinite(value)) return map;
+  const x0 = Math.max(0, Math.min(from[0], to[0]));
+  const x1 = Math.min(map.width - 1, Math.max(from[0], to[0]));
+  const y0 = Math.max(0, Math.min(from[1], to[1]));
+  const y1 = Math.min(map.height - 1, Math.max(from[1], to[1]));
+  let elevations = world.elevations;
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const index = y * map.width + x;
+      const current = elevations?.[index] ?? world.heights[index] ?? 0;
+      const next = mode === "set" ? clampMetres(value) : clampMetres(current + value);
+      if (next === current && elevations?.[index] !== undefined) continue;
+      if (next === current && mode === "delta") continue;
+      if (elevations === world.elevations) elevations = { ...elevations };
+      elevations![index] = next;
+    }
+  }
+  return elevations === world.elevations ? map : { ...map, world: { ...world, elevations } };
+}
+
+export function flattenElevationRect(map: TileMap, from: Point, to: Point, targetMetres?: number): TileMap {
+  const world = map.world;
+  if (!world) return map;
+  const x0 = Math.max(0, Math.min(from[0], to[0]));
+  const x1 = Math.min(map.width - 1, Math.max(from[0], to[0]));
+  const y0 = Math.max(0, Math.min(from[1], to[1]));
+  const y1 = Math.min(map.height - 1, Math.max(from[1], to[1]));
+  let metres = targetMetres;
+  if (metres === undefined) {
+    let sum = 0, count = 0;
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const index = y * map.width + x;
+        const h = world.elevations?.[index] ?? world.heights[index] ?? 0;
+        if (h <= -1.5) continue;
+        sum += h;
+        count++;
+      }
+    }
+    if (!count) return map;
+    metres = clampMetres(sum / count);
+  }
+  return fillElevationRect(map, from, to, "set", metres);
+}
+
+export function pickCell(map: TileMap, layerId: string, at: Point): Cell | null {
+  const [x, y] = at;
+  if (x < 0 || y < 0 || x >= map.width || y >= map.height) return null;
+  const index = y * map.width + x;
+  const active = map.layers.find(layer => layer.id === layerId);
+  if (active?.visible && active.cells[index]) return active.cells[index];
+  for (let i = map.layers.length - 1; i >= 0; i--) {
+    const layer = map.layers[i];
+    if (layer.visible && layer.cells[index]) return layer.cells[index];
+  }
+  return null;
+}
+
+export function fillRect(map: TileMap, layerId: string, from: Point, to: Point, cell: Cell | null): TileMap {
+  const layer = map.layers.find(candidate => candidate.id === layerId && candidate.visible);
+  if (!layer) return map;
+  const x0 = Math.max(0, Math.min(from[0], to[0]));
+  const x1 = Math.min(map.width - 1, Math.max(from[0], to[0]));
+  const y0 = Math.max(0, Math.min(from[1], to[1]));
+  const y1 = Math.min(map.height - 1, Math.max(from[1], to[1]));
+  let cells = layer.cells;
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const index = y * map.width + x;
+      if (equalCell(cells[index], cell)) continue;
+      if (cells === layer.cells) cells = { ...cells };
+      if (cell) cells[index] = cell;
+      else delete cells[index];
+    }
+  }
+  return cells === layer.cells ? map : {
+    ...map,
+    layers: map.layers.map(candidate => candidate === layer ? { ...layer, cells } : candidate),
+  };
+}
+
+export function floodFill(map: TileMap, layerId: string, start: Point, cell: Cell | null): TileMap {
+  const layer = map.layers.find(candidate => candidate.id === layerId && candidate.visible);
+  if (!layer) return map;
+  const [sx, sy] = start;
+  if (sx < 0 || sy < 0 || sx >= map.width || sy >= map.height) return map;
+  const startIndex = sy * map.width + sx;
+  const origin = layer.cells[startIndex] ?? null;
+  if (equalCell(origin ?? undefined, cell)) return map;
+  const visited = new Uint8Array(map.width * map.height);
+  const queue: number[] = [startIndex];
+  visited[startIndex] = 1;
+  const cells = { ...layer.cells };
+  for (let head = 0; head < queue.length; head++) {
+    const index = queue[head];
+    if (cell) cells[index] = cell;
+    else delete cells[index];
+    const x = index % map.width;
+    const y = Math.floor(index / map.width);
+    const neighbors = [
+      x > 0 ? index - 1 : -1,
+      x + 1 < map.width ? index + 1 : -1,
+      y > 0 ? index - map.width : -1,
+      y + 1 < map.height ? index + map.width : -1,
+    ];
+    for (const next of neighbors) {
+      if (next < 0 || visited[next]) continue;
+      if (!equalCell(layer.cells[next], origin)) continue;
+      visited[next] = 1;
+      queue.push(next);
+    }
+  }
+  return {
+    ...map,
+    layers: map.layers.map(candidate => candidate === layer ? { ...layer, cells } : candidate),
+  };
+}
+
+export function upsertEncounter(map: TileMap, encounter: WorldEncounter): TileMap {
+  const world = map.world;
+  if (!world) return map;
+  const list = world.encounters ?? [];
+  const exists = list.some(item => item.id === encounter.id);
+  const encounters = exists
+    ? list.map(item => item.id === encounter.id ? encounter : item)
+    : [...list, encounter];
+  return { ...map, world: { ...world, encounters } };
+}
+
+export function moveEncounter(map: TileMap, id: string, x: number, z: number): TileMap {
+  const world = map.world;
+  const target = world?.encounters?.find(item => item.id === id);
+  if (!world || !target) return map;
+  const clampedX = Math.round(Math.max(world.origin[0], Math.min(world.origin[0] + map.width * world.metresPerTile - 0.001, x)) * 1000) / 1000;
+  const clampedZ = Math.round(Math.max(world.origin[1], Math.min(world.origin[1] + map.height * world.metresPerTile - 0.001, z)) * 1000) / 1000;
+  if (target.position[0] === clampedX && target.position[2] === clampedZ) return map;
+  const tile = groundIndex(world, map.width, clampedX, clampedZ);
+  const y = Math.round((world.elevations?.[tile] ?? world.heights[tile] ?? target.position[1]) * 1000) / 1000;
+  return {
+    ...map,
+    world: {
+      ...world,
+      encounters: world.encounters!.map(item => item.id === id ? { ...item, position: [clampedX, y, clampedZ] } : item),
+    },
+  };
+}
+
+export function deleteEncounter(map: TileMap, id: string): TileMap {
+  const world = map.world;
+  if (!world?.encounters?.some(item => item.id === id)) return map;
+  const encounters = world.encounters.filter(item => item.id !== id);
+  return { ...map, world: { ...world, encounters: encounters.length ? encounters : undefined } };
 }
 
 export function paletteTileCount(mode: PaletteMode): number {

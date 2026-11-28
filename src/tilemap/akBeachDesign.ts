@@ -1,6 +1,7 @@
 import { decodeProject } from "./files";
 import { gridPosition, type Cell, type TileMap } from "./model";
-import { AK_DESIGNED_PROJECT_URL, AK_PREVIEW_VERSION } from "./world";
+import { AK_DESIGNED_PROJECT_URL, AK_PREVIEW_VERSION, AK_PROJECT_URL } from "./world";
+import { materializeDeltaProject } from "./worldRebase";
 
 export const AK_COAST_TILESET_ID = "ak-coast";
 export const AK_COAST_LAYER_ID = "ak-coast-deco";
@@ -249,10 +250,18 @@ export function migrateLegacyAkDraft(draft: TileMap, designed: TileMap): TileMap
   };
 }
 
-export async function readAkDesignedProject(): Promise<TileMap> {
+export async function readAkDesignedProject(baseline?: TileMap): Promise<TileMap> {
   const response = await fetch(AK_DESIGNED_PROJECT_URL);
   if (!response.ok) throw new Error("无法读取 AK 设计地图项目包。");
-  return decodeProject(new Uint8Array(await response.arrayBuffer()));
+  const doc = await decodeProject(new Uint8Array(await response.arrayBuffer()));
+  if (!doc.world?.delta) return doc;
+  let base = baseline;
+  if (!base) {
+    const baseRes = await fetch(AK_PROJECT_URL);
+    if (!baseRes.ok) throw new Error("无法读取 AK 基线快照。");
+    base = await decodeProject(new Uint8Array(await baseRes.arrayBuffer()));
+  }
+  return materializeDeltaProject(doc, base);
 }
 
 /**
@@ -264,7 +273,7 @@ export async function applyAkBeachDesign(map?: TileMap): Promise<TileMap> {
   if (map && (map.world?.id !== "ak-world-v1" || map.width !== AK_WIDTH || map.height !== AK_HEIGHT)) {
     return map;
   }
-  const designed = await readAkDesignedProject();
+  const designed = await readAkDesignedProject(map && !map.layers.some(l => l.id === AK_COAST_LAYER_ID) ? map : undefined);
   if (map && needsLegacyAkMigration(map)) {
     return migrateLegacyAkDraft(map, designed);
   }

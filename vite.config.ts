@@ -16,4 +16,16 @@ export default defineConfig({
       "@lib": path.resolve(__dirname, "./src/shared"),
     },
   },
+  build: {
+    chunkSizeWarningLimit: 600,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes("node_modules/three/")) return "three";
+          if (id.includes("node_modules/react/") || id.includes("node_modules/react-dom/")) return "react-vendor";
+          if (id.includes("node_modules/fflate/")) return "zip";
+        },
+      },
+    },
+  },
 });

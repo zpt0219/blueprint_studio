@@ -93,7 +93,7 @@
 .tm-map:focus-visible { outline-offset: -2px; }
 .tm-map.tm-pan { cursor: grab; }
 .tm-map.tm-pan:active { cursor: grabbing; }
-.tm-tools { position: absolute; top: 10px; left: 12px; }
+.tm-tools { position: absolute; top: 10px; left: 12px; flex-wrap: wrap; max-width: calc(100% - 210px); z-index: 2; }
 .tm-layers { position: absolute; top: 10px; right: 12px; z-index: 2; }
 .tm-layers summary {
   display: list-item;
@@ -141,6 +141,22 @@
 }
 .tm-map-hint { display: flex; gap: 10px; bottom: 9px; left: 12px; }
 .tm-view-label { top: 10px; left: 12px; }
+.tm-preview-toggle {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  z-index: 2;
+  font-size: 12px;
+  min-height: 26px !important;
+  padding: 2px 8px !important;
+}
+.tm-encounter-inspector input, .tm-encounter-inspector select {
+  min-height: 26px !important;
+  padding: 2px 6px !important;
+  font-size: 12px;
+}
+.tm-encounter-inspector input[type="number"] { width: 64px; }
+.tm-encounter-inspector input[type="text"] { width: 132px; }
 .tm-preview-error { position: absolute; inset: 35% 12px auto; text-align: center; }
 
 .tm-materials { border-top: 1px solid var(--tm-line); background: #f7faf7; }

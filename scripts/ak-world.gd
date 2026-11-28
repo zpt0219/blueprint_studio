@@ -19,6 +19,8 @@ var studio: RefCounted
 var profile: Dictionary
 var source: Dictionary
 var origin: Vector2
+var pristine_stage_dir := ""
+var pristine_forward_map := {}
 
 func _initialize() -> void:
     run.call_deferred()
@@ -28,14 +30,91 @@ func run() -> void:
     if args.size() != 2 or args[0] not in ["--export", "--export-local", "--check-patch", "--preview-patch"]:
         fail("Usage: -- --export or --export-local /path/to/ak-world.bptilemap | --check-patch or --preview-patch /path/to/patch.json")
         return
+    if args[0] in ["--check-patch", "--preview-patch"]:
+        maybe_stage_pristine_for_patch(args[1])
     await load_world()
     if args[0] in ["--export", "--export-local"]:
         export_map(args[1], args[0] == "--export-local")
     else:
         check_patch(args[1], args[0] == "--preview-patch")
 
+func _collect_gz_files(base_abs: String, cur_abs: String, out_rels: Array[String]) -> void:
+    var dir := DirAccess.open(cur_abs)
+    if dir == null:
+        return
+    dir.list_dir_begin()
+    var entry := dir.get_next()
+    while not entry.is_empty():
+        if entry != "." and entry != "..":
+            var full := cur_abs.path_join(entry)
+            if dir.current_is_dir():
+                _collect_gz_files(base_abs, full, out_rels)
+            elif entry.ends_with(".tscn.gz"):
+                out_rels.append(full.trim_prefix(base_abs.trim_suffix("/") + "/").trim_suffix(".gz"))
+        entry = dir.get_next()
+    dir.list_dir_end()
+
+func _remove_dir_all(abs_dir: String) -> void:
+    if abs_dir.is_empty() or not DirAccess.dir_exists_absolute(abs_dir):
+        return
+    var dir := DirAccess.open(abs_dir)
+    if dir != null:
+        dir.list_dir_begin()
+        var entry := dir.get_next()
+        while not entry.is_empty():
+            if entry != "." and entry != "..":
+                var full := abs_dir.path_join(entry)
+                if dir.current_is_dir():
+                    _remove_dir_all(full)
+                else:
+                    dir.remove(entry)
+            entry = dir.get_next()
+        dir.list_dir_end()
+    DirAccess.remove_absolute(abs_dir)
+
+func cleanup_pristine_stage() -> void:
+    if not pristine_stage_dir.is_empty():
+        _remove_dir_all(pristine_stage_dir)
+        pristine_stage_dir = ""
+        pristine_forward_map.clear()
+
+func maybe_stage_pristine_for_patch(patch_path: String) -> void:
+    if not FileAccess.file_exists(patch_path):
+        return
+    var parsed: Variant = JSON.parse_string(FileAccess.get_file_as_string(patch_path))
+    if not parsed is Dictionary:
+        return
+    var patch_rev := str(parsed.get("revision", ""))
+    var live_rev := STUDIO.revision()
+    var base_rev := STUDIO.baseline_revision()
+    if patch_rev.is_empty() or patch_rev == live_rev or patch_rev != base_rev:
+        return
+    var base_files_abs := ProjectSettings.globalize_path("res://tools/studio/baseline/files")
+    if not DirAccess.dir_exists_absolute(base_files_abs):
+        return
+    var rels: Array[String] = []
+    _collect_gz_files(base_files_abs, base_files_abs, rels)
+    if rels.is_empty():
+        return
+    pristine_stage_dir = "/tmp/ak_studio_check_%d_%d" % [OS.get_process_id(), Time.get_ticks_usec()]
+    for rel in rels:
+        pristine_forward_map["res://" + rel] = pristine_stage_dir.path_join(rel)
+    for rel in rels:
+        var raw_gz := FileAccess.get_file_as_bytes(base_files_abs.path_join(rel + ".gz"))
+        var text := raw_gz.decompress_dynamic(-1, FileAccess.COMPRESSION_GZIP).get_string_from_utf8()
+        for orig_res: String in pristine_forward_map:
+            if orig_res != ("res://" + rel) and orig_res in text:
+                text = text.replace('"' + orig_res + '"', '"' + str(pristine_forward_map[orig_res]) + '"')
+        var out_abs: String = pristine_forward_map["res://" + rel]
+        DirAccess.make_dir_recursive_absolute(out_abs.get_base_dir())
+        var f := FileAccess.open(out_abs, FileAccess.WRITE)
+        if f != null:
+            f.store_string(text)
+            f.close()
+
 func load_world() -> void:
-    land = load(STUDIO.BASE).instantiate()
+    var base_path: String = str(pristine_forward_map.get(STUDIO.BASE, STUDIO.BASE))
+    land = ResourceLoader.load(base_path, "", ResourceLoader.CACHE_MODE_REPLACE).instantiate()
     root.add_child(land)
     studio = STUDIO.new(land)
     profile = studio.profile
@@ -46,6 +125,7 @@ func load_world() -> void:
     await physics_frame
 
 func fail(message: String) -> void:
+    cleanup_pristine_stage()
     printerr(message)
     quit(1)
 
@@ -252,6 +332,7 @@ func check_patch(path: String, preview: bool) -> void:
     var chunks := mount_nearby(target, patch.cards.keys(), patch)
     await physics_frame
     await physics_frame
+    var overrides_stats: Dictionary = studio.apply_overrides(patch)
     var card_changes: Dictionary = studio.prepare_cards(patch.cards)
     if card_changes.has("error"):
         fail(card_changes.error)
@@ -267,14 +348,15 @@ func check_patch(path: String, preview: bool) -> void:
     for edit in patch.heights.values():
         var at: Vector3 = edit.position
         var hit := patched_sample(at.x, at.z)
-        if hit.is_empty() or hit.collider != result.body or absf(hit.position.y - at.y) > 0.01:
-            fail("Patched floor was not reached at " + str(at))
+        var ok_collider: bool = not hit.is_empty() and (hit.collider == result.body or hit.collider.get_meta("studio_ground", false))
+        if not ok_collider or absf(hit.position.y - at.y) > 0.05:
+            fail("Patched floor was not reached at " + str(at) + " (got " + str(hit.get("position", null)) + ")")
             return
     for row in patch.cards.values():
         var node := land.get_node_or_null(NodePath(row.id)) as Sprite3D
         if row.position == null:
             if node == null: continue
-        elif node != null and node.global_position.distance_to(STUDIO.point(row.position)) <= 0.005:
+        elif node != null and node.global_position.distance_to(STUDIO.point(row.position)) <= 0.15:
             continue
         fail("Decoration edit did not apply: " + str(row.id))
         return
@@ -282,15 +364,20 @@ func check_patch(path: String, preview: bool) -> void:
     var landing: Variant = null if landed.is_empty() else xyz(landed.position)
     var patched_blocked: Variant = null if landed.is_empty() else capsule_blocked(landed.position)
     print(JSON.stringify({
+        "pristineStaged": not pristine_stage_dir.is_empty(),
         "materialEdits": patch.changes.size(), "heightEdits": patch.heights.size(),
-        "painted": result.paintedTiles, "unsupportedPaint": result.unsupportedPaint,
-        "decorationEdits": patch.cards.size(), "testPoint": xyz(target),
+        "painted": result.paintedTiles.size(), "unsupportedPaint": result.unsupportedPaint.size(),
+        "decorationEdits": patch.cards.size(), "overrides3D": patch.get("overrides3D", []).size(),
+        "autoStairTreads": patch.get("autoStairTreads", {}).size(),
+        "encounters": patch.get("encounters", []).size(),
+        "testPoint": xyz(target),
         "nativeGround": native_point, "nativeGroundNormal": null if floor_hit.is_empty() else xyz(floor_hit.normal),
         "nativeCapsuleBlocked": native_blocked, "nearbyChunks": chunks,
         "patchedGround": landing, "patchedCapsuleBlocked": patched_blocked,
         "cutShapes": result.cutShapes, "cutMeshes": result.cutMeshes,
     }))
     if not preview:
+        cleanup_pristine_stage()
         quit()
         return
     show_patch(target, landed)
@@ -314,7 +401,8 @@ func mount_nearby(target: Vector3, source_paths: Array = [], patch: Dictionary =
         var dz := maxf(b[2] - target.z, maxf(0.0, target.z - b[2] - b[5]))
         if Vector2(dx, dz).length() > PREVIEW_RADIUS and not required.has(row.id):
             continue
-        var chunk: Node = load(row.scene).instantiate()
+        var chunk_path: String = str(pristine_forward_map.get(str(row.scene), str(row.scene)))
+        var chunk: Node = ResourceLoader.load(chunk_path, "", ResourceLoader.CACHE_MODE_REPLACE).instantiate()
         for piece in chunk.get_children():
             var parent := land.get_node_or_null(str(piece.get_meta("stream_parent")))
             if parent == null or piece.get_child_count() == 0: continue

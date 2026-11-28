@@ -8,7 +8,13 @@ import { WorldCards, type WorldImages } from "./worldCards";
 import { buildWorldFeatures } from "./worldFeatures";
 import { WorldTerrain } from "./worldTerrain";
 import { canWalk, worldWallTest } from "./worldWalk";
-import { gridPosition, type Point, type Surface, type WorldMap } from "./model";
+import { gridPosition, type EncounterKind, type Point, type Surface, type WorldMap } from "./model";
+
+const ENCOUNTER_3D_COLORS: Record<EncounterKind, string> = {
+  boss: "#e11d48",
+  encounter: "#f59e0b",
+  trigger: "#0ea5e9",
+};
 
 interface Props {
   width: number;
@@ -24,6 +30,7 @@ interface Preview {
   update: (surfaces: Array<Surface | undefined>, atlases: Atlases) => void;
   locatePlayer: (x: number, z: number) => void;
   decorate: (world: WorldMap, images: WorldImages) => void;
+  setShowBlockers: (visible: boolean) => void;
 }
 
 const movementKeys = new Set(["KeyW", "KeyA", "KeyS", "KeyD", "ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight"]);
@@ -40,6 +47,7 @@ export default function MapPreview({ width, height, atlases, surfaces, world, fo
   const [error, setError] = useState(false);
   const [imageError, setImageError] = useState(false);
   const [terrainError, setTerrainError] = useState(false);
+  const [showBlockers, setShowBlockers] = useState(false);
   const [images, setImages] = useState<WorldImages>(new Map());
   const textures = world?.textures;
   useEffect(() => {
@@ -135,9 +143,12 @@ export default function MapPreview({ width, height, atlases, surfaces, world, fo
     let ground: Array<Surface | undefined> = [];
     let group: THREE.Group | undefined;
     let decoration: THREE.Group | undefined;
+    let blockerGroup: THREE.Group | undefined;
+    let blockersVisible = false;
     let testMark: THREE.Mesh | undefined;
     let details: THREE.Group | undefined;
     let detailData: WorldMap["details"];
+    let activeWorld: WorldMap | undefined;
     let cards: WorldCards | undefined;
     let cardImages: WorldImages | undefined;
     let fitPending = true;
@@ -193,6 +204,101 @@ export default function MapPreview({ width, height, atlases, surfaces, world, fo
       if (!meshes) return;
       scene.remove(meshes);
       disposeMesh(meshes);
+    }
+
+    function clearOverlayGroup(meshes?: THREE.Group) {
+      if (!meshes) return;
+      scene.remove(meshes);
+      for (const child of meshes.children) {
+        const mesh = child as THREE.Mesh;
+        mesh.geometry?.dispose();
+        if (Array.isArray(mesh.material)) mesh.material.forEach(m => m.dispose());
+        else mesh.material?.dispose();
+      }
+    }
+
+    function rebuildBlockers() {
+      clearOverlayGroup(blockerGroup);
+      blockerGroup = undefined;
+      if (!blockersVisible) return;
+      const overlay = new THREE.Group();
+      const tilePositions: number[] = [];
+      const pushQuad = (arr: number[], x0: number, z0: number, x1: number, z1: number, y: number) => {
+        arr.push(x0, y, z0, x0, y, z1, x1, y, z1, x0, y, z0, x1, y, z1, x1, y, z0);
+      };
+      const stepPositions: number[] = [];
+      const landHeight = (col: number, row: number): number | undefined => {
+        if (col < 0 || row < 0 || col >= width || row >= height) return undefined;
+        const idx = row * width + col;
+        const h = terrain && !terrain.hasReplacement(idx) ? terrain.heightAt(col + 0.5, row + 0.5) : ground[idx]?.height;
+        if (h === undefined) return undefined;
+        return isWorld && h * metres <= -1.5 ? undefined : h;
+      };
+
+      for (let row = 0; row < height; row++) {
+        for (let col = 0; col < width; col++) {
+          const idx = row * width + col;
+          const surface = ground[idx];
+          if (!surface) continue;
+          const baseH = landHeight(col, row);
+          if (baseH === undefined) continue;
+          const y = baseH + 0.035;
+          if (surface.blocked) {
+            pushQuad(tilePositions, col + 0.04, row + 0.04, col + 0.96, row + 0.96, y);
+          }
+          for (const prop of surface.decorations ?? []) {
+            if (!prop.blocked) continue;
+            const half = Math.min(prop.size[0] * 0.35, 0.8) / 2;
+            pushQuad(tilePositions, col + 0.5 - half, row + 0.5 - half, col + 0.5 + half, row + 0.5 + half, y + 0.01);
+          }
+          // Highlight impassable vertical step boundaries (> 0.35m step height)
+          const neighbors: Array<[number, number, number, number, number, number]> = [
+            [col + 1, row, col + 0.92, row + 0.04, col + 1.0, row + 0.96],
+            [col, row + 1, col + 0.04, row + 0.92, col + 0.96, row + 1.0],
+          ];
+          for (const [nc, nr, x0, z0, x1, z1] of neighbors) {
+            const nh = landHeight(nc, nr);
+            if (nh !== undefined && Math.abs(nh - baseH) * metres > 0.36) {
+              pushQuad(stepPositions, x0, z0, x1, z1, Math.max(baseH, nh) + 0.045);
+            }
+          }
+        }
+      }
+
+      if (tilePositions.length) {
+        const geom = new THREE.BufferGeometry();
+        geom.setAttribute("position", new THREE.Float32BufferAttribute(tilePositions, 3));
+        const mat = new THREE.MeshBasicMaterial({
+          color: "#e11d48", transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false,
+        });
+        overlay.add(new THREE.Mesh(geom, mat));
+      }
+      if (stepPositions.length) {
+        const geom = new THREE.BufferGeometry();
+        geom.setAttribute("position", new THREE.Float32BufferAttribute(stepPositions, 3));
+        const mat = new THREE.MeshBasicMaterial({
+          color: "#f97316", transparent: true, opacity: 0.65, side: THREE.DoubleSide, depthWrite: false,
+        });
+        overlay.add(new THREE.Mesh(geom, mat));
+      }
+      if (activeWorld?.wallColliders?.length) {
+        const wallMat = new THREE.MeshBasicMaterial({
+          color: "#dc2626", transparent: true, opacity: 0.38, depthWrite: false,
+        });
+        for (const wall of activeWorld.wallColliders) {
+          const [wx, wz] = gridPosition(activeWorld, wall.position[0], wall.position[2]);
+          const mesh = new THREE.Mesh(
+            new THREE.BoxGeometry(wall.size[0] / metres, wall.size[1] / metres, wall.size[2] / metres),
+            wallMat.clone(),
+          );
+          mesh.position.set(wx, wall.position[1] / metres, wz);
+          mesh.rotation.y = wall.yaw;
+          overlay.add(mesh);
+        }
+        wallMat.dispose();
+      }
+      blockerGroup = overlay;
+      scene.add(blockerGroup);
     }
 
     function heightAt(x: number, z: number) {
@@ -269,6 +375,7 @@ export default function MapPreview({ width, height, atlases, surfaces, world, fo
           seaMask.needsUpdate = true;
           group = buildMesh(ground, width, height, pending.atlases, isWorld, terrain);
           scene.add(group);
+          if (blockersVisible) rebuildBlockers();
           pending = undefined;
         }
         if (fitPending) {
@@ -340,7 +447,13 @@ export default function MapPreview({ width, height, atlases, surfaces, world, fo
         }
         render();
       },
+      setShowBlockers(visible) {
+        blockersVisible = visible;
+        rebuildBlockers();
+        render();
+      },
       decorate(world, images) {
+        activeWorld = world;
         if (wallData !== world.wallColliders) {
           wallData = world.wallColliders;
           wallAt = worldWallTest(world);
@@ -387,7 +500,7 @@ export default function MapPreview({ width, height, atlases, surfaces, world, fo
           }
           cardImages = images;
         }
-        clearGroup(decoration);
+        clearOverlayGroup(decoration);
         decoration = new THREE.Group();
         testMark = undefined;
         for (const proxy of world.proxies) {
@@ -407,7 +520,35 @@ export default function MapPreview({ width, height, atlases, surfaces, world, fo
           decoration.add(mark);
           testMark = mark;
         }
+        for (const enc of world.encounters ?? []) {
+          const [ex, ez] = gridPosition(world, enc.position[0], enc.position[2]);
+          const ey = (heightAt(ex, ez) ?? enc.position[1] / metres);
+          const r = Math.max(0.25, enc.radius / metres);
+          const color = ENCOUNTER_3D_COLORS[enc.kind];
+          const ring = new THREE.Mesh(
+            new THREE.RingGeometry(Math.max(0.05, r - 0.14), r, 48),
+            new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.72, side: THREE.DoubleSide, depthWrite: false }),
+          );
+          ring.rotation.x = -Math.PI / 2;
+          ring.position.set(ex, ey + 0.05, ez);
+          decoration.add(ring);
+
+          const aura = new THREE.Mesh(
+            new THREE.CylinderGeometry(r, r, 0.55, 48, 1, true),
+            new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.16, side: THREE.DoubleSide, depthWrite: false }),
+          );
+          aura.position.set(ex, ey + 0.28, ez);
+          decoration.add(aura);
+
+          const beacon = new THREE.Mesh(
+            new THREE.OctahedronGeometry(enc.kind === "boss" ? 0.38 : 0.28, 0),
+            new THREE.MeshBasicMaterial({ color: enc.kind === "boss" ? "#facc15" : color }),
+          );
+          beacon.position.set(ex, ey + 1.15, ez);
+          decoration.add(beacon);
+        }
         scene.add(decoration);
+        if (blockersVisible) rebuildBlockers();
         render();
       },
     };
@@ -417,7 +558,8 @@ export default function MapPreview({ width, height, atlases, surfaces, world, fo
       window.clearInterval(animateFeatures);
       if (frame !== null) cancelAnimationFrame(frame);
       clearGroup(group);
-      clearGroup(decoration);
+      clearOverlayGroup(decoration);
+      clearOverlayGroup(blockerGroup);
       clearGroup(details);
       terrain?.dispose();
       seaMask.dispose();
@@ -453,9 +595,14 @@ export default function MapPreview({ width, height, atlases, surfaces, world, fo
   const terrain = world?.terrain;
   const walls = world?.wallColliders;
   const testPoint = world?.testPoint;
+  const encounters = world?.encounters;
   useEffect(() => {
     if (world) preview.current?.decorate(world, images);
-  }, [width, height, isWorld, metres, cardData, proxies, details, terrain, walls, testPoint, images, world?.elevations]);
+  }, [width, height, isWorld, metres, cardData, proxies, details, terrain, walls, testPoint, encounters, images, world?.elevations]);
+
+  useEffect(() => {
+    preview.current?.setShowBlockers(showBlockers);
+  }, [width, height, isWorld, metres, showBlockers]);
 
   useEffect(() => {
     const [x, z] = focus ?? [Math.floor(width / 2) + 0.5, Math.floor(height / 2) + 0.5];
@@ -467,6 +614,9 @@ export default function MapPreview({ width, height, atlases, surfaces, world, fo
       <div ref={scenePane} className="tm-preview-pane tm-preview-flight" role="region" aria-label="自由视角" tabIndex={0}
         title="Q/E 升降，F 回到全图">
         <span className="tm-view-label">自由视角 · 右键转向 · WASD 飞行 · Shift 加速</span>
+        <button type="button" className="tm-preview-toggle" aria-pressed={showBlockers}
+          onPointerDown={event => event.stopPropagation()}
+          onClick={() => setShowBlockers(value => !value)}>显示阻挡</button>
       </div>
       <div ref={gamePane} className="tm-preview-pane tm-preview-game" role="region" aria-label="游戏视角" tabIndex={0}
         onPointerDown={event => event.currentTarget.focus({ preventScroll: true })}>
